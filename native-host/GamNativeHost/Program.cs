@@ -20,11 +20,12 @@ try
 
     var browserToken = File.ReadAllText(config.BrowserTokenPath, Encoding.UTF8).Trim();
     if (browserToken.Length < 32) throw new InvalidOperationException("Browser token is missing or invalid.");
+    using var forwarder = new PipeForwarder(config.PipeName);
     using var input = Console.OpenStandardInput();
     using var output = Console.OpenStandardOutput();
     while (TryReadFrame(input, out var payload))
     {
-        var response = Handle(payload, config, browserToken, allowedMethods);
+        var response = Handle(payload, config, browserToken, allowedMethods, forwarder);
         WriteFrame(output, response);
     }
 }
@@ -70,7 +71,12 @@ static void WriteFrame(Stream output, byte[] payload)
     output.Flush();
 }
 
-static byte[] Handle(byte[] payload, HostConfig config, string browserToken, HashSet<string> allowedMethods)
+static byte[] Handle(
+    byte[] payload,
+    HostConfig config,
+    string browserToken,
+    HashSet<string> allowedMethods,
+    PipeForwarder forwarder)
 {
     string id = "unknown";
     try
@@ -88,7 +94,7 @@ static byte[] Handle(byte[] payload, HostConfig config, string browserToken, Has
             ["auth"] = new JsonObject { ["browserToken"] = browserToken },
         };
         if (request["params"] is JsonObject parameters) forwarded["params"] = parameters.DeepClone();
-        return Forward(config.PipeName, Encoding.UTF8.GetBytes(forwarded.ToJsonString()));
+        return forwarder.Forward(Encoding.UTF8.GetBytes(forwarded.ToJsonString()));
     }
     catch (Exception error)
     {
@@ -107,20 +113,64 @@ static byte[] Error(string id, string code, string message)
     return Encoding.UTF8.GetBytes(value.ToJsonString());
 }
 
-static byte[] Forward(string pipeName, byte[] request)
+sealed class PipeForwarder : IDisposable
 {
-    var name = pipeName.StartsWith("\\\\.\\pipe\\", StringComparison.OrdinalIgnoreCase)
-        ? pipeName[9..]
-        : pipeName;
-    using var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.None);
-    pipe.Connect(3000);
-    using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
-    using var reader = new StreamReader(pipe, new UTF8Encoding(false), false, leaveOpen: true);
-    writer.WriteLine(Encoding.UTF8.GetString(request));
-    var response = reader.ReadLine() ?? throw new IOException("gamd closed the pipe without a response.");
-    var payload = Encoding.UTF8.GetBytes(response);
-    if (payload.Length > MaxMessageBytes) throw new InvalidDataException("gamd response is too large.");
-    return payload;
+    private readonly string pipeName;
+    private NamedPipeClientStream? pipe;
+    private StreamWriter? writer;
+    private StreamReader? reader;
+
+    public PipeForwarder(string configuredPipeName)
+    {
+        pipeName = configuredPipeName.StartsWith("\\\\.\\pipe\\", StringComparison.OrdinalIgnoreCase)
+            ? configuredPipeName[9..]
+            : configuredPipeName;
+    }
+
+    public byte[] Forward(byte[] request)
+    {
+        Exception? failure = null;
+        for (var attempt = 0; attempt < 2; attempt += 1)
+        {
+            try
+            {
+                EnsureConnected();
+                writer!.WriteLine(Encoding.UTF8.GetString(request));
+                var response = reader!.ReadLine() ?? throw new IOException("gamd closed the pipe without a response.");
+                var payload = Encoding.UTF8.GetBytes(response);
+                if (payload.Length > MaxMessageBytes) throw new InvalidDataException("gamd response is too large.");
+                return payload;
+            }
+            catch (Exception error) when (error is IOException or TimeoutException or InvalidOperationException or ObjectDisposedException)
+            {
+                failure = error;
+                Reset();
+            }
+        }
+        throw failure ?? new IOException("Unable to forward native request to gamd.");
+    }
+
+    private void EnsureConnected()
+    {
+        if (pipe?.IsConnected == true && writer is not null && reader is not null) return;
+        Reset();
+        pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None);
+        pipe.Connect(3000);
+        writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+        reader = new StreamReader(pipe, new UTF8Encoding(false), false, leaveOpen: true);
+    }
+
+    private void Reset()
+    {
+        try { writer?.Dispose(); } catch { }
+        try { reader?.Dispose(); } catch { }
+        try { pipe?.Dispose(); } catch { }
+        writer = null;
+        reader = null;
+        pipe = null;
+    }
+
+    public void Dispose() => Reset();
 }
 
 sealed record HostConfig(string PipeName, string BrowserTokenPath, string AllowedOrigin, string InstanceId)
