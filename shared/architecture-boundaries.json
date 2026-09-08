@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "sourceRoots": [
+    "src",
+    "control/src"
+  ],
+  "exclusiveTokens": [
+    {
+      "token": "chrome.tabs.create(",
+      "owners": ["src/background.ts"],
+      "reason": "Fleet runtime exclusively owns physical tab creation."
+    },
+    {
+      "token": "chrome.tabs.remove(",
+      "owners": ["src/background.ts"],
+      "reason": "Fleet runtime exclusively owns physical tab removal."
+    },
+    {
+      "token": "chrome.runtime.connectNative(",
+      "owners": ["src/nativeMessageTransport.ts"],
+      "reason": "Native transport lifecycle belongs to one adapter."
+    },
+    {
+      "token": "chrome.runtime.sendNativeMessage(",
+      "owners": ["src/nativeControlLegacy.ts"],
+      "reason": "One-shot native messaging is quarantined legacy code."
+    },
+    {
+      "token": ".click();",
+      "owners": ["src/chatgptAdapter.ts"],
+      "reason": "Physical DOM effects belong to the ChatGPT adapter."
+    },
+    {
+      "token": "sessionStorage.",
+      "owners": ["src/content.ts"],
+      "reason": "Page-local projection state belongs to the content runtime."
+    }
+  ],
+  "importQuarantines": [
+    {
+      "module": "./nativeControlLegacy",
+      "owners": ["src/nativeControl.ts", "src/nativeControlPersistent.ts"],
+      "reason": "Legacy native code may only be consumed by the façade and migration adapter."
+    }
+  ],
+  "forbiddenImports": [
+    {
+      "sourcePattern": "control/src/*Authority.ts",
+      "targetBasenames": ["rpc", "rpcLegacy", "ipc", "gam", "gamd"],
+      "reason": "Kernel authorities must not depend on transport or launcher layers."
+    }
+  ],
+  "fileLineBudgets": [
+    {
+      "path": "src/background.ts",
+      "maxLines": 950,
+      "reason": "Background remains a coordinator rather than a business-logic container."
+    }
+  ]
+}
