@@ -12,6 +12,11 @@ import {
 
 const WORK_TRANSPORT_KEY = 'nativeWorkTransport.v1';
 
+export interface NativeWorkDocumentMutation {
+  kind: 'task' | 'attempt' | 'message';
+  document: Record<string, unknown>;
+}
+
 function record(value: unknown, label: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${label} is invalid`);
   return value as Record<string, unknown>;
@@ -95,15 +100,29 @@ async function workTransportGeneration(): Promise<string> {
   return generation;
 }
 
-async function workPayloadHash(input: NativeWorkSnapshot): Promise<string> {
-  const bytes = new TextEncoder().encode(JSON.stringify({
-    revision: input.revision,
-    tasks: input.tasks,
-    attempts: input.attempts,
-    messages: input.messages,
-  }));
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
+async function sha256Json(value: unknown): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(value)));
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function workPayloadHash(input: NativeWorkSnapshot): Promise<string> {
+  return sha256Json({ revision: input.revision, tasks: input.tasks, attempts: input.attempts, messages: input.messages });
+}
+
+async function sendRetriedWorkRequest(request: { id: string; method: string; params: Record<string, unknown> }): Promise<NativeRpcResponse> {
+  let response: NativeRpcResponse | undefined;
+  let transportError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      response = parseNativeRpcResponse(await sendPersistentNativeMessage(NATIVE_CONTROL_HOST, request));
+      transportError = undefined;
+      break;
+    } catch (error) {
+      transportError = error;
+    }
+  }
+  if (transportError || !response) throw unavailable(transportError);
+  return response;
 }
 
 export async function readNativeControlSnapshot(): Promise<NativeControlSnapshot> {
@@ -140,18 +159,7 @@ export async function replaceNativeWorkState(input: NativeWorkSnapshot): Promise
       messages: input.messages,
     },
   };
-  let response: NativeRpcResponse | undefined;
-  let transportError: unknown;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      response = parseNativeRpcResponse(await sendPersistentNativeMessage(NATIVE_CONTROL_HOST, request));
-      transportError = undefined;
-      break;
-    } catch (error) {
-      transportError = error;
-    }
-  }
-  if (transportError || !response) throw unavailable(transportError);
+  const response = await sendRetriedWorkRequest(request);
   return parseNativeWorkSnapshot(nativeResult(response, request.id, request.method));
 }
 
@@ -162,12 +170,7 @@ export async function mutateNativeWorkDocument(input: {
 }): Promise<number> {
   const generation = await workTransportGeneration();
   const sequence = input.expectedRevision + 1;
-  const payloadHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({
-    kind: input.kind,
-    expectedRevision: input.expectedRevision,
-    document: input.document,
-  })));
-  const digest = [...new Uint8Array(payloadHash)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  const digest = await sha256Json({ kind: input.kind, expectedRevision: input.expectedRevision, document: input.document });
   const transportMessageId = `work-mutate:${generation}:${sequence}:${digest}`;
   const request = {
     id: crypto.randomUUID(),
@@ -181,20 +184,35 @@ export async function mutateNativeWorkDocument(input: {
       document: input.document,
     },
   };
-  let response: NativeRpcResponse | undefined;
-  let transportError: unknown;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      response = parseNativeRpcResponse(await sendPersistentNativeMessage(NATIVE_CONTROL_HOST, request));
-      transportError = undefined;
-      break;
-    } catch (error) {
-      transportError = error;
-    }
-  }
-  if (transportError || !response) throw unavailable(transportError);
+  const response = await sendRetriedWorkRequest(request);
   const result = record(nativeResult(response, request.id, request.method), 'work mutation result');
   return numberField(result.revision, 'work mutation revision');
+}
+
+export async function batchMutateNativeWorkDocuments(input: {
+  expectedRevision: number;
+  mutations: readonly NativeWorkDocumentMutation[];
+}): Promise<number> {
+  if (input.mutations.length === 0 || input.mutations.length > 32) throw new Error('Native work batch must contain between 1 and 32 mutations');
+  const generation = await workTransportGeneration();
+  const sequence = input.expectedRevision + 1;
+  const mutations = input.mutations.map((mutation) => ({ kind: mutation.kind, document: mutation.document }));
+  const digest = await sha256Json({ expectedRevision: input.expectedRevision, mutations });
+  const transportMessageId = `work-batch:${generation}:${sequence}:${digest}`;
+  const request = {
+    id: crypto.randomUUID(),
+    method: 'work.batch-mutate',
+    params: {
+      expectedRevision: input.expectedRevision,
+      transportGeneration: generation,
+      transportSequence: sequence,
+      transportMessageId,
+      mutations,
+    },
+  };
+  const response = await sendRetriedWorkRequest(request);
+  const result = record(nativeResult(response, request.id, request.method), 'work batch mutation result');
+  return numberField(result.revision, 'work batch mutation revision');
 }
 
 export async function reconcileNativeElasticFleet(): Promise<unknown> {
