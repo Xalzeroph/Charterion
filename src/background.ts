@@ -23,6 +23,7 @@ import { TabOperationQueue } from './tabOperationQueue';
 import { FleetTabRegistry } from './fleetTabRegistry';
 import { RUNTIME_STORAGE_KEYS } from './runtimeStorageKeys';
 import { RUNTIME_POLICY } from './runtimePolicy';
+import { ensureAutomationAlarms, isAutomationAlarm } from './runtimeAutomation';
 import { controlFeedbackMessages } from './controlFeedback';
 import { ContentRuntimeFence } from './contentRuntimeFence';
 import { browserOperationPolicy } from './browserOperationPolicy';
@@ -58,10 +59,7 @@ const {
   maxParallelBrowserProbes: MAX_PARALLEL_BROWSER_PROBES,
   maxParallelTabDispatches: MAX_PARALLEL_TAB_DISPATCHES,
 } = RUNTIME_POLICY;
-const {
-  fleetReconcile: FLEET_RECONCILE_ALARM,
-  organizationDispatch: ORGANIZATION_DISPATCH_ALARM,
-} = RUNTIME_POLICY.alarms;
+
 const tabOperations = new TabOperationQueue();
 const contentRuntimeFence = new ContentRuntimeFence();
 const promptDispatchGovernor = new PromptDispatchGovernor({
@@ -875,18 +873,15 @@ void migrateLegacyWorkStateOnce().then(() => reconcileAfterRestart()).then(() =>
 }).catch((error) => {
   void reportIncident('restart-reconciliation-failed', 'service-worker', { error: error instanceof Error ? error.message : String(error) }, 'critical');
 });
-async function ensureAutomationAlarms(): Promise<void> {
-  const alarms = await Promise.all([chrome.alarms.get(FLEET_RECONCILE_ALARM), chrome.alarms.get(ORGANIZATION_DISPATCH_ALARM)]);
-  if (!alarms[0]) await chrome.alarms.create(FLEET_RECONCILE_ALARM, { periodInMinutes: RUNTIME_POLICY.automationAlarmPeriodMinutes }); if (!alarms[1]) await chrome.alarms.create(ORGANIZATION_DISPATCH_ALARM, { periodInMinutes: RUNTIME_POLICY.automationAlarmPeriodMinutes });
-}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== FLEET_RECONCILE_ALARM && alarm.name !== ORGANIZATION_DISPATCH_ALARM) return;
+  if (!isAutomationAlarm(alarm.name)) return;
   scheduleBrowserRuntimeReport();
   scheduleFleetReconcile(0);
   void dispatchOrganizationTasks().catch((error) => reportIncident('organization-auto-dispatch-failed', 'organization-runtime', { error: error instanceof Error ? error.message : String(error) }));
 });
-chrome.runtime.onInstalled.addListener(() => { void ensureAutomationAlarms().catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
-chrome.runtime.onStartup.addListener(() => { void ensureAutomationAlarms().catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
+chrome.runtime.onInstalled.addListener(() => { void ensureAutomationAlarms(chrome.alarms).catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
+chrome.runtime.onStartup.addListener(() => { void ensureAutomationAlarms(chrome.alarms).catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
 void reportBrowserRuntimeFromTabs([]).catch((error) => reportIncident('browser-runtime-report-failed', 'startup', { error: error instanceof Error ? error.message : String(error) }));
 scheduleBrowserRuntimeReport();
-void ensureAutomationAlarms().catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); void closeOrphanBlankTabs().catch((error) => reportIncident('orphan-blank-tab-cleanup-failed', 'extension', { error: String(error) })); void dispatchOrganizationTasks().catch((error) => reportIncident('organization-auto-dispatch-failed', 'organization-runtime', { error: error instanceof Error ? error.message : String(error) }));
+void ensureAutomationAlarms(chrome.alarms).catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); void closeOrphanBlankTabs().catch((error) => reportIncident('orphan-blank-tab-cleanup-failed', 'extension', { error: String(error) })); void dispatchOrganizationTasks().catch((error) => reportIncident('organization-auto-dispatch-failed', 'organization-runtime', { error: error instanceof Error ? error.message : String(error) }));
