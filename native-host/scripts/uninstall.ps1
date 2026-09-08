@@ -3,7 +3,9 @@ param(
   [switch]$KeepInstalledFiles
 )
 $ErrorActionPreference = 'Stop'
-$HostName = 'com.charterion.control'
+. (Join-Path $PSScriptRoot 'NativeRpcProtocol.generated.ps1')
+$HostName = $CharterionNativeHostName
+if ([string]::IsNullOrWhiteSpace($HostName)) { throw 'Generated Native Host name is missing.' }
 $registryPaths = @(
   "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName",
   "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$HostName"
