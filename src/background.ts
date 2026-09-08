@@ -21,6 +21,7 @@ import { CoalescingRunner } from './coalescingRunner';
 import { TabOperationQueue } from './tabOperationQueue';
 import { FleetTabRegistry } from './fleetTabRegistry';
 import { RUNTIME_STORAGE_KEYS } from './runtimeStorageKeys';
+import { RUNTIME_POLICY } from './runtimePolicy';
 import { controlFeedbackMessages } from './controlFeedback';
 import { ContentRuntimeFence } from './contentRuntimeFence';
 import { browserOperationPolicy } from './browserOperationPolicy';
@@ -51,9 +52,15 @@ const {
   messages: MESSAGES_KEY,
   supervisor: SUPERVISOR_KEY,
 } = RUNTIME_STORAGE_KEYS;
-const CONTROL_REQUEST_MESSAGE_PREFIX = 'control-request:';
-const MAX_PARALLEL_BROWSER_PROBES = 6;
-const MAX_PARALLEL_TAB_DISPATCHES = 4;
+const {
+  controlRequestMessagePrefix: CONTROL_REQUEST_MESSAGE_PREFIX,
+  maxParallelBrowserProbes: MAX_PARALLEL_BROWSER_PROBES,
+  maxParallelTabDispatches: MAX_PARALLEL_TAB_DISPATCHES,
+} = RUNTIME_POLICY;
+const {
+  fleetReconcile: FLEET_RECONCILE_ALARM,
+  organizationDispatch: ORGANIZATION_DISPATCH_ALARM,
+} = RUNTIME_POLICY.alarms;
 const tabOperations = new TabOperationQueue();
 const contentRuntimeFence = new ContentRuntimeFence();
 const promptDispatchGovernor = new PromptDispatchGovernor({
@@ -550,7 +557,7 @@ function scheduleBrowserRuntimeReport(): void {
   browserReportTimer = setTimeout(() => {
     browserReportTimer = undefined;
     browserRuntimeReportRunner.kick();
-  }, 250) as unknown as number;
+  }, RUNTIME_POLICY.browserRuntimeReportDebounceMs) as unknown as number;
 }
 let fleetReconcileTimer: number | undefined;
 
@@ -673,12 +680,12 @@ async function reconcileAgentFleetOnce(): Promise<void> {
   });
 }
 let organizationRetryTimer: number | undefined;
-function retryOrganizationExecution(): void { if (organizationRetryTimer !== undefined) return; organizationRetryTimer = setTimeout(() => { organizationRetryTimer = undefined; scheduleFleetReconcile(0); }, 1000) as unknown as number; }
+function retryOrganizationExecution(): void { if (organizationRetryTimer !== undefined) return; organizationRetryTimer = setTimeout(() => { organizationRetryTimer = undefined; scheduleFleetReconcile(0); }, RUNTIME_POLICY.organizationRetryMs) as unknown as number; }
 async function dispatchOrganizationTasks(): Promise<void> { const tasks = (await workState()).tasks; if (!hasOrganizationExecutionTask(tasks)) return; if (markOrganizationExecutionObserved(tasks)) void reportIncident('organization-auto-dispatch-observed', 'organization-runtime', {}); const results = await runReadyTasks(); if (results.some((result) => !result.ok)) retryOrganizationExecution(); }
 const fleetReconcileRunner = new CoalescingRunner(reconcileAgentFleetOnce, (error) => {
   void reportIncident('fleet-reconcile-failed', 'fleet-runtime', { error: error instanceof Error ? error.message : String(error) });
 });
-function scheduleFleetReconcile(delayMs = 150): void {
+function scheduleFleetReconcile(delayMs: number = RUNTIME_POLICY.fleetReconcileDebounceMs): void {
   if (fleetReconcileTimer !== undefined) clearTimeout(fleetReconcileTimer);
   fleetReconcileTimer = setTimeout(() => { fleetReconcileTimer = undefined; fleetReconcileRunner.kick(); }, delayMs) as unknown as number;
 }
@@ -872,10 +879,9 @@ void migrateLegacyWorkStateOnce().then(() => reconcileAfterRestart()).then(() =>
 }).catch((error) => {
   void reportIncident('restart-reconciliation-failed', 'service-worker', { error: error instanceof Error ? error.message : String(error) }, 'critical');
 });
-const FLEET_RECONCILE_ALARM = 'gam:fleet-reconcile'; const ORGANIZATION_DISPATCH_ALARM = 'gam:organization-dispatch';
 async function ensureAutomationAlarms(): Promise<void> {
   const alarms = await Promise.all([chrome.alarms.get(FLEET_RECONCILE_ALARM), chrome.alarms.get(ORGANIZATION_DISPATCH_ALARM)]);
-  if (!alarms[0]) await chrome.alarms.create(FLEET_RECONCILE_ALARM, { periodInMinutes: 1 }); if (!alarms[1]) await chrome.alarms.create(ORGANIZATION_DISPATCH_ALARM, { periodInMinutes: 1 });
+  if (!alarms[0]) await chrome.alarms.create(FLEET_RECONCILE_ALARM, { periodInMinutes: RUNTIME_POLICY.automationAlarmPeriodMinutes }); if (!alarms[1]) await chrome.alarms.create(ORGANIZATION_DISPATCH_ALARM, { periodInMinutes: RUNTIME_POLICY.automationAlarmPeriodMinutes });
 }
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== FLEET_RECONCILE_ALARM && alarm.name !== ORGANIZATION_DISPATCH_ALARM) return;
