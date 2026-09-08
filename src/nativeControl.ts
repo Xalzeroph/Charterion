@@ -1,4 +1,5 @@
 export * from './nativeControlLegacy';
+export type { NativeWorkDocumentMutation } from './nativeControlPersistent';
 export {
   readNativeControlSnapshot,
   reportNativeBrowserRuntime,
@@ -6,6 +7,7 @@ export {
   readNativeWorkSnapshot,
   replaceNativeWorkState,
   mutateNativeWorkDocument,
+  batchMutateNativeWorkDocuments,
   reconcileNativeElasticFleet,
   reportNativeAgentRuntime,
   planNativeBrowserOperation,
