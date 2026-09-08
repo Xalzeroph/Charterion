@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "scripts": {
     "generate:native-rpc-contract": "node scripts/generate-native-rpc-contract.mjs",
-    "check:native-rpc-contract": "node scripts/generate-native-rpc-contract.mjs --check",
+    "check:native-rpc-contract": "node scripts/generate-native-rpc-contract.mjs --check && node scripts/check-native-rpc-routing.mjs",
     "build": "npm run generate:native-rpc-contract && node scripts/build.mjs",
     "check": "npm run check:native-rpc-contract && tsc --noEmit",
     "test": "vitest run --pool=forks --fileParallelism=false",
