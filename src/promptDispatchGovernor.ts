@@ -32,7 +32,8 @@ export const DEFAULT_PROMPT_DISPATCH_POLICY: Readonly<PromptDispatchPolicy> = Ob
   slotMinIntervalMs: 12_000,
   maxConcurrentGenerations: 2,
   generationRetryMs: 5_000,
-  maxInlineWaitMs: 10_000,  jitterMs: 750,
+  maxInlineWaitMs: 10_000,
+  jitterMs: 750,
   baseRateLimitBackoffMs: 5 * 60_000,
   maxRateLimitBackoffMs: 60 * 60_000,
   rateLimitStrikeResetMs: 6 * 60 * 60_000,
@@ -64,6 +65,7 @@ export interface PromptDispatchGovernorStore {
   read(): Promise<unknown>;
   write(state: PromptDispatchGovernorState): Promise<void>;
 }
+
 function emptyState(): PromptDispatchGovernorState {
   return {
     schemaVersion: 1,
@@ -176,6 +178,7 @@ function reserveDispatch(
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
 export class PromptDispatchGovernor {
   private tail: Promise<void> = Promise.resolve();
   private readonly generationReservations = new Map<string, string>();
@@ -189,64 +192,75 @@ export class PromptDispatchGovernor {
     private readonly random: () => number = Math.random,
   ) {}
 
-  acquire(scope: PromptDispatchScope): Promise<PromptDispatchPermit> {
-    const run = this.tail.then(() => this.acquireSerialized(scope), () => this.acquireSerialized(scope));
-    this.tail = run.then(() => undefined, () => undefined);
-    return run;
+  async acquire(scope: PromptDispatchScope): Promise<PromptDispatchPermit> {
+    const startedAt = this.clock();
+    let permit = await this.serialize(() => this.tryAcquireSerialized(scope, startedAt));
+    if (
+      permit.allowed ||
+      permit.reason === 'generation-capacity' ||
+      permit.reason === 'rate-limit-backoff' ||
+      permit.retryAfterMs > this.policy.maxInlineWaitMs
+    ) {
+      return permit;
+    }
+
+    const jitter = Math.max(0, Math.floor(this.random() * this.policy.jitterMs));
+    await this.sleep(permit.retryAfterMs + jitter);
+    permit = await this.serialize(() => this.tryAcquireSerialized(scope, startedAt));
+    return permit;
   }
 
   noteRateLimit(): Promise<number> {
-    const run = this.tail.then(() => this.noteRateLimitSerialized(), () => this.noteRateLimitSerialized());
-    this.tail = run.then(() => undefined, () => undefined);
-    return run;
+    return this.serialize(() => this.noteRateLimitSerialized());
   }
 
   releaseGenerationReservation(reservationId: string): Promise<void> {
-    const run = this.tail.then(() => {
-      this.generationReservations.delete(reservationId);
-    }, () => {
+    return this.serialize(async () => {
       this.generationReservations.delete(reservationId);
     });
-    this.tail = run.then(() => undefined, () => undefined);
-    return run;
   }
 
   releaseGenerationReservationsForKey(reservationKey: string): Promise<void> {
-    const run = this.tail.then(() => {
-      for (const [reservationId, key] of this.generationReservations) {
-        if (key === reservationKey) this.generationReservations.delete(reservationId);
-      }
-    }, () => {
+    return this.serialize(async () => {
       for (const [reservationId, key] of this.generationReservations) {
         if (key === reservationKey) this.generationReservations.delete(reservationId);
       }
     });
+  }
+
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.tail.then(operation, operation);
     this.tail = run.then(() => undefined, () => undefined);
     return run;
   }
 
-  private async acquireSerialized(scope: PromptDispatchScope): Promise<PromptDispatchPermit> {
-    const startedAt = this.clock();
-    const scopedForCapacity = { ...scope, activeGenerations: scope.activeGenerations + this.generationReservations.size };
-    let state = normalizePromptDispatchState(await this.store.read(), startedAt, this.policy);
-    let plan = planPromptDispatch(state, scopedForCapacity, startedAt, this.policy);
-    if (!plan.allowed) {
-      if (plan.reason === 'generation-capacity' || plan.reason === 'rate-limit-backoff' || plan.retryAfterMs > this.policy.maxInlineWaitMs) return plan;
-      const jitter = Math.max(0, Math.floor(this.random() * this.policy.jitterMs));
-      await this.sleep(plan.retryAfterMs + jitter);
-      const now = this.clock();
-      state = normalizePromptDispatchState(await this.store.read(), now, this.policy);
-      plan = planPromptDispatch(state, { ...scope, activeGenerations: scope.activeGenerations + this.generationReservations.size }, now, this.policy);
-      if (!plan.allowed) return plan;
-    }
+  private async tryAcquireSerialized(scope: PromptDispatchScope, startedAt: number): Promise<PromptDispatchPermit> {
+    const now = this.clock();
+    const state = normalizePromptDispatchState(await this.store.read(), now, this.policy);
+    const plan = planPromptDispatch(
+      state,
+      { ...scope, activeGenerations: scope.activeGenerations + this.generationReservations.size },
+      now,
+      this.policy,
+    );
+    if (!plan.allowed) return plan;
+
     const reservedAt = this.clock();
     await this.store.write(reserveDispatch(state, scope, reservedAt, this.policy));
     const generationReservationId = scope.reservationKey
       ? `generation-reservation:${++this.reservationSequence}`
       : undefined;
-    if (generationReservationId && scope.reservationKey) this.generationReservations.set(generationReservationId, scope.reservationKey);
-    return { allowed: true, reservedAt, waitedMs: Math.max(0, reservedAt - startedAt), ...(generationReservationId ? { generationReservationId } : {}) };
+    if (generationReservationId && scope.reservationKey) {
+      this.generationReservations.set(generationReservationId, scope.reservationKey);
+    }
+    return {
+      allowed: true,
+      reservedAt,
+      waitedMs: Math.max(0, reservedAt - startedAt),
+      ...(generationReservationId ? { generationReservationId } : {}),
+    };
   }
+
   private async noteRateLimitSerialized(): Promise<number> {
     const now = this.clock();
     const state = normalizePromptDispatchState(await this.store.read(), now, this.policy);
