@@ -4,9 +4,10 @@ import { resolve } from 'node:path';
 const root = resolve(import.meta.dirname, '..');
 const read = (path) => readFile(resolve(root, path), 'utf8');
 
-const [manifestText, rpc, organizationRpc, persistent, legacy, facade] = await Promise.all([
+const [manifestText, rpc, rpcLegacy, organizationRpc, persistent, legacy, facade] = await Promise.all([
   read('shared/native-rpc-protocol.json'),
   read('control/src/rpc.ts'),
+  read('control/src/rpcLegacy.ts'),
   read('control/src/organizationRpc.ts'),
   read('src/nativeControlPersistent.ts'),
   read('src/nativeControlLegacy.ts'),
@@ -16,8 +17,10 @@ const [manifestText, rpc, organizationRpc, persistent, legacy, facade] = await P
 const manifest = JSON.parse(manifestText);
 const declared = new Set(manifest.methods.map((method) => method.name));
 const routed = new Set(['health']);
-for (const source of [rpc, organizationRpc]) {
+for (const source of [rpc, rpcLegacy, organizationRpc]) {
   for (const match of source.matchAll(/case\s+['"]([^'"]+)['"]\s*:/g)) routed.add(match[1]);
+  for (const match of source.matchAll(/request\.method\s*!==\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
+  for (const match of source.matchAll(/request\.method\s*===\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
 }
 
 const unrouted = [...declared].filter((method) => !routed.has(method));
