@@ -53,16 +53,16 @@ export function assertMessageDeliveryAvailable(
   attempts: readonly SendAttemptRecord[],
   conversationKey: string,
 ): void {
+  if (message.attemptIds.length === 0) return;
   const owned = new Set(message.attemptIds);
-  const prior = attempts.filter((attempt) =>
-    owned.has(attempt.attemptId) && attempt.conversationKey === conversationKey,
-  );
-  if (prior.some((attempt) => attempt.state === 'uncertain')) {
-    throw new Error('Message has an uncertain prior delivery to this conversation');
-  }
-  const consumed = prior.find((attempt) => attempt.state !== 'failed');
-  if (consumed) {
-    throw new Error(`Message already has a non-failed delivery attempt for ${conversationKey}`);
+  for (const attempt of attempts) {
+    if (!owned.has(attempt.attemptId) || attempt.conversationKey !== conversationKey) continue;
+    if (attempt.state === 'uncertain') {
+      throw new Error('Message has an uncertain prior delivery to this conversation');
+    }
+    if (attempt.state !== 'failed') {
+      throw new Error(`Message already has a non-failed delivery attempt for ${conversationKey}`);
+    }
   }
 }
 
@@ -73,16 +73,52 @@ export interface MessageDispatchPlan {
 }
 
 function discoverRecipients(message: AgentMessage, tabs: readonly ManagedTab[]): ManagedTab[] | string {
-  const projectTabs = tabs.filter((tab) => tab.binding.project.trim() === message.project);
-  if (message.target.kind === 'role') {
-    const role = message.target.role;
-    const matches = projectTabs.filter((tab) => tab.binding.role.trim() === role);
+  const matches: ManagedTab[] = [];
+  const role = message.target.kind === 'role' ? message.target.role : undefined;
+  for (const tab of tabs) {
+    if (tab.binding.project.trim() !== message.project) continue;
+    const tabRole = tab.binding.role.trim();
+    if (role !== undefined ? tabRole === role : tabRole.length > 0) matches.push(tab);
+  }
+  if (role !== undefined) {
     if (matches.length === 0) return `No ChatGPT tab is bound to role ${role}`;
     if (matches.length > 1) return `Multiple ChatGPT tabs match role ${role}; routing is ambiguous`;
     return matches;
   }
-  const matches = projectTabs.filter((tab) => tab.binding.role.trim().length > 0);
   return matches.length > 0 ? matches : `No ChatGPT tab is bound to project ${message.project}`;
+}
+
+function consumedMessageConversations(
+  message: AgentMessage,
+  attempts: readonly SendAttemptRecord[],
+): Set<string> | string {
+  if (message.attemptIds.length === 0) return new Set<string>();
+  const owned = new Set(message.attemptIds);
+  const consumed = new Set<string>();
+  for (const attempt of attempts) {
+    if (!owned.has(attempt.attemptId)) continue;
+    if (attempt.state === 'uncertain') {
+      return 'Message has an uncertain prior delivery; create a new message after inspection instead of risking a duplicate.';
+    }
+    if (CONSUMED_ATTEMPT_STATES.has(attempt.state)) consumed.add(attempt.conversationKey);
+  }
+  return consumed;
+}
+
+function indexPendingTabs(
+  pendingKeys: readonly string[],
+  tabs: readonly ManagedTab[],
+): Map<string, ManagedTab[]> {
+  const pending = new Set(pendingKeys);
+  const byConversation = new Map<string, ManagedTab[]>();
+  for (const tab of tabs) {
+    const key = tab.snapshot.conversationKey;
+    if (!pending.has(key)) continue;
+    const matches = byConversation.get(key);
+    if (matches) matches.push(tab);
+    else byConversation.set(key, [tab]);
+  }
+  return byConversation;
 }
 
 export function planMessageDispatch(
@@ -91,15 +127,9 @@ export function planMessageDispatch(
   tabs: readonly ManagedTab[],
 ): MessageDispatchPlan {
   validateAgentMessage(message);
-  const messageAttempts = message.attemptIds
-    .map((id) => attempts.find((attempt) => attempt.attemptId === id))
-    .filter((attempt): attempt is SendAttemptRecord => attempt !== undefined);
-  if (messageAttempts.some((attempt) => attempt.state === 'uncertain')) {
-    return { tabIds: [], error: 'Message has an uncertain prior delivery; create a new message after inspection instead of risking a duplicate.' };
-  }
-  const consumed = new Set(messageAttempts
-    .filter((attempt) => CONSUMED_ATTEMPT_STATES.has(attempt.state))
-    .map((attempt) => attempt.conversationKey));
+  const consumed = consumedMessageConversations(message, attempts);
+  if (typeof consumed === 'string') return { tabIds: [], error: consumed };
+
   let recipientConversationKeys: string[];
   if (message.recipientConversationKeys) {
     recipientConversationKeys = [...message.recipientConversationKeys];
@@ -112,9 +142,10 @@ export function planMessageDispatch(
   const pendingKeys = recipientConversationKeys.filter((key) => !consumed.has(key));
   if (pendingKeys.length === 0) return { tabIds: [], recipientConversationKeys };
 
+  const tabsByConversation = indexPendingTabs(pendingKeys, tabs);
   const pendingTabs: ManagedTab[] = [];
   for (const key of pendingKeys) {
-    const matches = tabs.filter((tab) => tab.snapshot.conversationKey === key);
+    const matches = tabsByConversation.get(key) ?? [];
     if (matches.length === 0) return { tabIds: [], recipientConversationKeys, error: `Recipient conversation ${key} is not open` };
     if (matches.length > 1) return { tabIds: [], recipientConversationKeys, error: `Recipient conversation ${key} is open in multiple tabs` };
     const tab = matches[0]!;
