@@ -8,7 +8,7 @@ using System.Text.RegularExpressions;
 const int MaxMessageBytes = 1024 * 1024;
 var allowedMethods = new HashSet<string>(StringComparer.Ordinal)
 {
-    "health", "control.snapshot", "browser.report", "browser.status", "agent.browser-report", "agent.runtime-report", "agent.rollover-request", "agent.rollover-begin", "agent.rollover-bootstrap", "agent.rollover-complete", "agent.rollover-fail", "agent.rollover-status", "browser.operation-plan", "browser.operation-dispatch", "browser.operation-settle", "incident.report", "project.list", "agent.list", "resource.list", "lease.list", "events.list", "work.snapshot", "work.replace", "work.mutate", "fleet.reconcile", "workspace.provision", "workspace.list"
+    "health", "control.snapshot", "browser.report", "browser.status", "agent.browser-report", "agent.runtime-report", "agent.rollover-request", "agent.rollover-begin", "agent.rollover-bootstrap", "agent.rollover-complete", "agent.rollover-fail", "agent.rollover-status", "browser.operation-plan", "browser.operation-dispatch", "browser.operation-settle", "incident.report", "project.list", "agent.list", "resource.list", "lease.list", "events.list", "work.snapshot", "work.replace", "work.mutate", "work.batch-mutate", "fleet.reconcile", "workspace.provision", "workspace.list"
 };
 
 try
