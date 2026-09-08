@@ -90,21 +90,35 @@ export function createBindingStore(storage: BindingStorage, keys: BindingKeys) {
   }
 
   async function update(tabId: number, conversationKey: string, binding: RoleBinding): Promise<void> {
-    const stores = await read();
-    if (conversationKey.startsWith('conversation:')) {
-      stores.persistent[conversationKey] = binding;
-      delete stores.ephemeral[String(tabId)];
-    } else {
-      stores.ephemeral[String(tabId)] = binding;
+    const tabKey = String(tabId);
+    if (!conversationKey.startsWith('conversation:')) {
+      const ephemeral = await readEphemeral();
+      ephemeral[tabKey] = binding;
+      await writeEphemeral(ephemeral);
+      return;
     }
-    await Promise.all([writePersistent(stores.persistent), writeEphemeral(stores.ephemeral)]);
+
+    const [persistent, ephemeral] = await Promise.all([readPersistent(), readEphemeral()]);
+    persistent[conversationKey] = binding;
+    const hadTemporary = Object.hasOwn(ephemeral, tabKey);
+    if (hadTemporary) delete ephemeral[tabKey];
+    await Promise.all([
+      writePersistent(persistent),
+      ...(hadTemporary ? [writeEphemeral(ephemeral)] : []),
+    ]);
   }
 
   async function clear(conversationKey: string | undefined, tabId: number | undefined): Promise<void> {
-    const stores = await read();
-    if (conversationKey) delete stores.persistent[conversationKey];
-    if (tabId !== undefined) delete stores.ephemeral[String(tabId)];
-    await Promise.all([writePersistent(stores.persistent), writeEphemeral(stores.ephemeral)]);
+    const [persistent, ephemeral] = await Promise.all([readPersistent(), readEphemeral()]);
+    const persistentChanged = Boolean(conversationKey && Object.hasOwn(persistent, conversationKey));
+    const tabKey = tabId === undefined ? undefined : String(tabId);
+    const ephemeralChanged = Boolean(tabKey !== undefined && Object.hasOwn(ephemeral, tabKey));
+    if (conversationKey && persistentChanged) delete persistent[conversationKey];
+    if (tabKey !== undefined && ephemeralChanged) delete ephemeral[tabKey];
+    await Promise.all([
+      ...(persistentChanged ? [writePersistent(persistent)] : []),
+      ...(ephemeralChanged ? [writeEphemeral(ephemeral)] : []),
+    ]);
   }
 
   return {
