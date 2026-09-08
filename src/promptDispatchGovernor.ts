@@ -183,6 +183,7 @@ export class PromptDispatchGovernor {
   private tail: Promise<void> = Promise.resolve();
   private readonly generationReservations = new Map<string, string>();
   private reservationSequence = 0;
+  private stateCache: PromptDispatchGovernorState | undefined;
 
   constructor(
     private readonly store: PromptDispatchGovernorStore,
@@ -194,20 +195,23 @@ export class PromptDispatchGovernor {
 
   async acquire(scope: PromptDispatchScope): Promise<PromptDispatchPermit> {
     const startedAt = this.clock();
-    let permit = await this.serialize(() => this.tryAcquireSerialized(scope, startedAt));
-    if (
-      permit.allowed ||
-      permit.reason === 'generation-capacity' ||
-      permit.reason === 'rate-limit-backoff' ||
-      permit.retryAfterMs > this.policy.maxInlineWaitMs
-    ) {
-      return permit;
-    }
+    let inlineWaitSpent = 0;
+    while (true) {
+      const permit = await this.serialize(() => this.tryAcquireSerialized(scope, startedAt));
+      if (
+        permit.allowed ||
+        permit.reason === 'generation-capacity' ||
+        permit.reason === 'rate-limit-backoff'
+      ) {
+        return permit;
+      }
 
-    const jitter = Math.max(0, Math.floor(this.random() * this.policy.jitterMs));
-    await this.sleep(permit.retryAfterMs + jitter);
-    permit = await this.serialize(() => this.tryAcquireSerialized(scope, startedAt));
-    return permit;
+      const jitter = Math.max(0, Math.floor(this.random() * this.policy.jitterMs));
+      const waitMs = permit.retryAfterMs + jitter;
+      if (inlineWaitSpent + waitMs > this.policy.maxInlineWaitMs) return permit;
+      inlineWaitSpent += waitMs;
+      await this.sleep(waitMs);
+    }
   }
 
   noteRateLimit(): Promise<number> {
@@ -234,9 +238,21 @@ export class PromptDispatchGovernor {
     return run;
   }
 
+  private async readState(now: number): Promise<PromptDispatchGovernorState> {
+    const source = this.stateCache ?? await this.store.read();
+    const normalized = normalizePromptDispatchState(source, now, this.policy);
+    this.stateCache = normalized;
+    return normalized;
+  }
+
+  private async writeState(state: PromptDispatchGovernorState): Promise<void> {
+    await this.store.write(state);
+    this.stateCache = state;
+  }
+
   private async tryAcquireSerialized(scope: PromptDispatchScope, startedAt: number): Promise<PromptDispatchPermit> {
     const now = this.clock();
-    const state = normalizePromptDispatchState(await this.store.read(), now, this.policy);
+    const state = await this.readState(now);
     const plan = planPromptDispatch(
       state,
       { ...scope, activeGenerations: scope.activeGenerations + this.generationReservations.size },
@@ -246,7 +262,7 @@ export class PromptDispatchGovernor {
     if (!plan.allowed) return plan;
 
     const reservedAt = this.clock();
-    await this.store.write(reserveDispatch(state, scope, reservedAt, this.policy));
+    await this.writeState(reserveDispatch(state, scope, reservedAt, this.policy));
     const generationReservationId = scope.reservationKey
       ? `generation-reservation:${++this.reservationSequence}`
       : undefined;
@@ -263,7 +279,7 @@ export class PromptDispatchGovernor {
 
   private async noteRateLimitSerialized(): Promise<number> {
     const now = this.clock();
-    const state = normalizePromptDispatchState(await this.store.read(), now, this.policy);
+    const state = await this.readState(now);
     const withinStrikeWindow = state.lastRateLimitAt !== undefined && now - state.lastRateLimitAt <= this.policy.rateLimitStrikeResetMs;
     const strikes = withinStrikeWindow ? state.rateLimitStrikes + 1 : 1;
     const exponent = Math.min(Math.max(0, strikes - 1), 20);
@@ -271,7 +287,7 @@ export class PromptDispatchGovernor {
     state.rateLimitStrikes = strikes;
     state.lastRateLimitAt = now;
     state.backoffUntil = Math.max(state.backoffUntil, now + backoffMs);
-    await this.store.write(state);
+    await this.writeState(state);
     return state.backoffUntil;
   }
 }
