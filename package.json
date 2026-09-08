@@ -50,12 +50,12 @@
     "smoke:self-hosting": "npm run build:control && node scripts/smoke-self-hosting.mjs"
   },
   "devDependencies": {
-    "@types/chrome": "^0.2.7",
+    "@types/chrome": "^0.2.8",
     "@types/jsdom": "^30.0.0",
-    "@types/node": "^26.4.0",
+    "@types/node": "^26.4.1",
     "esbuild": "^0.28.2",
     "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.11"
+    "vitest": "^5.0.0"
   }
 }
