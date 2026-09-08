@@ -34,6 +34,41 @@
       "token": "sessionStorage.",
       "owners": ["src/content.ts"],
       "reason": "Page-local projection state belongs to the content runtime."
+    },
+    {
+      "token": "bindings.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
+    },
+    {
+      "token": "tabBindings.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
+    },
+    {
+      "token": "sendAttempts.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
+    },
+    {
+      "token": "tasks.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
+    },
+    {
+      "token": "messages.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
+    },
+    {
+      "token": "supervisor.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
+    },
+    {
+      "token": "fleetTabs.v1",
+      "owners": ["src/runtimeStorageKeys.ts"],
+      "reason": "Runtime storage keys have one compatibility authority."
     }
   ],
   "importQuarantines": [

@@ -20,6 +20,8 @@ import { deriveBrowserRuntimeObservation, fleetExpansionAllowed } from './browse
 import { CoalescingRunner } from './coalescingRunner';
 import { TabOperationQueue } from './tabOperationQueue';
 import { MutationLane } from './mutationLane';
+import { FleetTabRegistry } from './fleetTabRegistry';
+import { RUNTIME_STORAGE_KEYS } from './runtimeStorageKeys';
 import { controlFeedbackMessages } from './controlFeedback';
 import { ContentRuntimeFence } from './contentRuntimeFence';
 import { browserOperationPolicy } from './browserOperationPolicy';
@@ -42,18 +44,18 @@ import {
   type SendResult,
   type TaskDispatchResult,
 } from './contracts';
-const BINDINGS_KEY = 'bindings.v1';
-const TAB_BINDINGS_KEY = 'tabBindings.v1';
-const SEND_ATTEMPTS_KEY = 'sendAttempts.v1';
-const TASKS_KEY = 'tasks.v1';
-const MESSAGES_KEY = 'messages.v1';
-const SUPERVISOR_KEY = 'supervisor.v1';
-const FLEET_TABS_KEY = 'fleetTabs.v1';
+const {
+  bindings: BINDINGS_KEY,
+  tabBindings: TAB_BINDINGS_KEY,
+  sendAttempts: SEND_ATTEMPTS_KEY,
+  tasks: TASKS_KEY,
+  messages: MESSAGES_KEY,
+  supervisor: SUPERVISOR_KEY,
+} = RUNTIME_STORAGE_KEYS;
 const CONTROL_REQUEST_MESSAGE_PREFIX = 'control-request:';
 const MAX_PARALLEL_BROWSER_PROBES = 6;
 const MAX_PARALLEL_TAB_DISPATCHES = 4;
 const bindingMutationLane = new MutationLane();
-const fleetTabMapMutationLane = new MutationLane();
 const tabOperations = new TabOperationQueue();
 const contentRuntimeFence = new ContentRuntimeFence();
 const promptDispatchGovernor = new PromptDispatchGovernor({
@@ -69,24 +71,9 @@ const bindingStore = createBindingStore(
   { persistent: BINDINGS_KEY, ephemeral: TAB_BINDINGS_KEY },
 );
 
-async function fleetTabMap(): Promise<Record<string, number>> {
-  const stored = await chrome.storage.session.get(FLEET_TABS_KEY);
-  const value = stored[FLEET_TABS_KEY];
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const result: Record<string, number> = {};
-  for (const [slotId, tabId] of Object.entries(value)) {
-    if (Number.isInteger(tabId) && Number(tabId) >= 0) result[slotId] = Number(tabId);
-  }
-  return result;
-}
 
-async function saveFleetTabMap(value: Record<string, number>): Promise<void> {
-  await chrome.storage.session.set({ [FLEET_TABS_KEY]: value });
-}
+const fleetTabs = new FleetTabRegistry(chrome.storage.session);
 
-function serializeFleetTabMapMutation<T>(operation: () => Promise<T>): Promise<T> {
-  return fleetTabMapMutationLane.run(operation);
-}
 async function reconcileAfterRestart(): Promise<void> {
   const state = await workState();
   const active = state.attempts.filter((attempt) =>
@@ -546,7 +533,7 @@ async function runReadyTasks(): Promise<TaskDispatchResult[]> {
   validateTaskGraph(state.tasks);
   const tasks = deriveManagedTasks(state.tasks, state.attempts);
   const tabs = await managedTabs(state.attempts);
-  const [controlSnapshot, mapping] = await Promise.all([readNativeControlSnapshot(), fleetTabMap()]);
+  const [controlSnapshot, mapping] = await Promise.all([readNativeControlSnapshot(), fleetTabs.read()]);
   return dispatchReadyManagedTasks(tasks, tabs, controlSnapshot, mapping, crypto.randomUUID(), dispatchToTab);
 }
 
@@ -652,12 +639,12 @@ async function deliverWorkerRequestMessages(snapshot: import('./nativeControl').
 }
 
 async function reconcileAgentFleetOnce(): Promise<void> {
-  return serializeFleetTabMapMutation(async () => {
+  return fleetTabs.run(async () => {
     await reconcileNativeElasticFleet();
     const snapshot = await readNativeControlSnapshot();
     const state = await workState();
     const currentTabs = await managedTabs(state.attempts);
-    const mapping = await fleetTabMap();
+    const mapping = await fleetTabs.read();
     const actions = planFleetReconciliation(snapshot.agents, currentTabs, mapping);
     const latestRuntime = [...snapshot.browserRuntime].sort((a, b) => b.observedAt - a.observedAt)[0];
     const currentRuntime = deriveBrowserRuntimeObservation(currentTabs.map((tab) => tab.snapshot.status));
@@ -671,38 +658,38 @@ async function reconcileAgentFleetOnce(): Promise<void> {
       if (action.kind === 'open') {
         if (!expansionAllowed) {
           if (agent.browserState !== 'absent') {
-            delete mapping[agent.id]; await saveFleetTabMap(mapping);
+            delete mapping[agent.id]; await fleetTabs.write(mapping);
             await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() });
           }
           continue;
         }
         const tab = await chrome.tabs.create({ url: action.url, active: false });
         if (tab.id === undefined) throw new Error(`Chrome did not return a tab id for agent slot ${agent.id}`);
-        mapping[agent.id] = tab.id; await saveFleetTabMap(mapping);
+        mapping[agent.id] = tab.id; await fleetTabs.write(mapping);
         const key = agent.conversationKey ?? `url:${action.url}`;
         await updateBinding(tab.id, key, { role: agent.role, project: project.name, notes: `GAM fleet slot ${agent.id}`, agentSlotId: agent.id });
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'opening', tabId: tab.id, observedAt: Date.now() });
       } else if (action.kind === 'rollover-start') {
         await beginNativeAgentRollover(agent.id, action.rolloverId); scheduleFleetReconcile(0);
       } else if (action.kind === 'rollover-close') {
-        await tabOperations.run(action.tabId, async () => { await beginNativeAgentRollover(agent.id, action.rolloverId); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'closing', tabId: action.tabId, observedAt: Date.now() }); await clearFleetBinding(agent.conversationKey, action.tabId); try { await chrome.tabs.remove(action.tabId); } catch (error) { await reportIncident('fleet-tab-close-failed', agent.id, { tabId: action.tabId, error: error instanceof Error ? error.message : String(error) }); } delete mapping[agent.id]; await saveFleetTabMap(mapping); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() }); });
+        await tabOperations.run(action.tabId, async () => { await beginNativeAgentRollover(agent.id, action.rolloverId); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'closing', tabId: action.tabId, observedAt: Date.now() }); await clearFleetBinding(agent.conversationKey, action.tabId); try { await chrome.tabs.remove(action.tabId); } catch (error) { await reportIncident('fleet-tab-close-failed', agent.id, { tabId: action.tabId, error: error instanceof Error ? error.message : String(error) }); } delete mapping[agent.id]; await fleetTabs.write(mapping); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() }); });
       } else if (action.kind === 'close') {
         await tabOperations.run(action.tabId, async () => {
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'closing', tabId: action.tabId, observedAt: Date.now() });
         await clearFleetBinding(agent.conversationKey, action.tabId);
         try { await chrome.tabs.remove(action.tabId); } catch (error) { await reportIncident('fleet-tab-close-failed', agent.id, { tabId: action.tabId, error: error instanceof Error ? error.message : String(error) }); }
-        delete mapping[agent.id]; await saveFleetTabMap(mapping);
+        delete mapping[agent.id]; await fleetTabs.write(mapping);
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() });
         });
       } else if (action.kind === 'report-open') {
-        mapping[agent.id] = action.tabId; await saveFleetTabMap(mapping);
+        mapping[agent.id] = action.tabId; await fleetTabs.write(mapping);
         const tab = currentTabs.find((item) => item.tabId === action.tabId);
         if (tab && (tab.binding.agentSlotId !== agent.id || tab.binding.role !== agent.role || tab.binding.project !== project.name)) {
           await updateBinding(tab.tabId, action.conversationKey ?? tab.snapshot.conversationKey, { role: agent.role, project: project.name, notes: `GAM fleet slot ${agent.id}`, agentSlotId: agent.id });
         }
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'open', tabId: action.tabId, ...(action.conversationKey ? { conversationKey: action.conversationKey } : {}), observedAt: Date.now() });
       } else {
-        delete mapping[agent.id]; await saveFleetTabMap(mapping);
+        delete mapping[agent.id]; await fleetTabs.write(mapping);
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() });
       }
       } catch (error) {
@@ -894,9 +881,9 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   contentRuntimeFence.remove(tabId);
-  void serializeFleetTabMapMutation(async () => {
+  void fleetTabs.run(async () => {
     const [mapping, bindingChanged] = await Promise.all([
-      fleetTabMap(),
+      fleetTabs.read(),
       serializeBindingMutation(async () => {
         const bindings = await bindingStore.readEphemeral();
         if (bindings[String(tabId)] === undefined) return false;
@@ -909,7 +896,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     for (const [slotId, mappedTabId] of Object.entries(mapping)) {
       if (mappedTabId === tabId) { delete mapping[slotId]; mappingChanged = true; }
     }
-    if (mappingChanged) await saveFleetTabMap(mapping);
+    if (mappingChanged) await fleetTabs.write(mapping);
     await notifyManagerChanged();
     scheduleFleetReconcile(0);
   }).catch((error) => reportIncident('tab-removal-reconciliation-failed', String(tabId), { error: error instanceof Error ? error.message : String(error) }));
