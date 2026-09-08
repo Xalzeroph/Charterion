@@ -6,7 +6,9 @@ param(
   [string]$PublishDir = (Join-Path (Split-Path $PSScriptRoot -Parent | Split-Path -Parent) 'dist-native-host')
 )
 $ErrorActionPreference = 'Stop'
-$HostName = 'com.charterion.control'
+. (Join-Path $PSScriptRoot 'NativeRpcProtocol.generated.ps1')
+$HostName = $CharterionNativeHostName
+if ([string]::IsNullOrWhiteSpace($HostName)) { throw 'Generated Native Host name is missing.' }
 if ($ExtensionId -notmatch '^[a-p]{32}$') { throw 'ExtensionId must be a 32-character Chromium extension id.' }
 if ($InstanceId -notmatch '^[0-9a-f]{16}$') { throw 'InstanceId must be a 16-character lowercase hex id.' }
 if ([string]::IsNullOrWhiteSpace($PipeName)) { throw 'PipeName is required.' }
