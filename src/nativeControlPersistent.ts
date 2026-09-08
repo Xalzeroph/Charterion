@@ -1,7 +1,7 @@
 import { nativeResult, parseNativeRpcResponse, type NativeRpcResponse } from './nativeRpcContract';
 import { sendPersistentNativeMessage } from './nativeMessageTransport';
+import { NATIVE_CONTROL_HOST, assertNativeRpcMethod, type NativeRpcMethod } from './nativeRpcProtocol.generated';
 import {
-  NATIVE_CONTROL_HOST,
   parseNativeControlSnapshot,
   type AgentBrowserReportInput,
   type AgentRuntimeReportInput,
@@ -49,7 +49,8 @@ function unavailable(error: unknown): Error {
   return new Error(`Native control plane is unavailable: ${error instanceof Error ? error.message : String(error)}`);
 }
 
-async function persistentNativeResult(method: string, params: Record<string, unknown>): Promise<unknown> {
+async function persistentNativeResult(method: NativeRpcMethod, params: Record<string, unknown>): Promise<unknown> {
+  assertNativeRpcMethod(method);
   const request = { id: crypto.randomUUID(), method, params };
   let response: NativeRpcResponse;
   try {
@@ -109,7 +110,8 @@ async function workPayloadHash(input: NativeWorkSnapshot): Promise<string> {
   return sha256Json({ revision: input.revision, tasks: input.tasks, attempts: input.attempts, messages: input.messages });
 }
 
-async function sendRetriedWorkRequest(request: { id: string; method: string; params: Record<string, unknown> }): Promise<NativeRpcResponse> {
+async function sendRetriedWorkRequest(request: { id: string; method: NativeRpcMethod; params: Record<string, unknown> }): Promise<NativeRpcResponse> {
+  assertNativeRpcMethod(request.method);
   let response: NativeRpcResponse | undefined;
   let transportError: unknown;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -148,7 +150,7 @@ export async function replaceNativeWorkState(input: NativeWorkSnapshot): Promise
   const transportMessageId = `work:${generation}:${sequence}:${payloadHash}`;
   const request = {
     id: crypto.randomUUID(),
-    method: 'work.replace',
+    method: 'work.replace' as const,
     params: {
       expectedRevision: input.revision,
       transportGeneration: generation,
@@ -174,7 +176,7 @@ export async function mutateNativeWorkDocument(input: {
   const transportMessageId = `work-mutate:${generation}:${sequence}:${digest}`;
   const request = {
     id: crypto.randomUUID(),
-    method: 'work.mutate',
+    method: 'work.mutate' as const,
     params: {
       kind: input.kind,
       expectedRevision: input.expectedRevision,
@@ -201,7 +203,7 @@ export async function batchMutateNativeWorkDocuments(input: {
   const transportMessageId = `work-batch:${generation}:${sequence}:${digest}`;
   const request = {
     id: crypto.randomUUID(),
-    method: 'work.batch-mutate',
+    method: 'work.batch-mutate' as const,
     params: {
       expectedRevision: input.expectedRevision,
       transportGeneration: generation,
