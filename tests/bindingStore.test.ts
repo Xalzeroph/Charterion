@@ -54,7 +54,49 @@ describe('binding store', () => {
     expect(local.writes()).toBe(1);
     expect(session.writes()).toBe(1);
   });
-  it('serializes update and clear semantics through the adapter API', async () => {
+
+  it('writes only session storage for provisional binding updates', async () => {
+    const local = memoryArea({ bindings: { 'conversation:one': { role: 'Old', project: 'P', notes: '' } } });
+    const session = memoryArea();
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+    const binding = { role: 'A', project: 'P', notes: '' };
+
+    await store.update(7, 'url:https://chatgpt.com/', binding);
+
+    expect(session.read().tabs).toEqual({ '7': binding });
+    expect(local.writes()).toBe(0);
+    expect(session.writes()).toBe(1);
+  });
+
+  it('does not rewrite session storage when a canonical update has no temporary binding', async () => {
+    const local = memoryArea();
+    const session = memoryArea({ tabs: {} });
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+    const binding = { role: 'A', project: 'P', notes: '' };
+
+    await store.update(7, 'conversation:two', binding);
+
+    expect(local.read().bindings).toEqual({ 'conversation:two': binding });
+    expect(local.writes()).toBe(1);
+    expect(session.writes()).toBe(0);
+  });
+
+  it('clears only stores that actually contain the requested binding', async () => {
+    const local = memoryArea({ bindings: { 'conversation:two': { role: 'A', project: 'P', notes: '' } } });
+    const session = memoryArea({ tabs: {} });
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+
+    await store.clear('conversation:two', 7);
+
+    expect(local.read().bindings).toEqual({});
+    expect(local.writes()).toBe(1);
+    expect(session.writes()).toBe(0);
+    await store.clear('conversation:missing', 99);
+    expect(local.writes()).toBe(1);
+    expect(session.writes()).toBe(0);
+  });
+
+  it('preserves update and clear semantics through the adapter API', async () => {
     const local = memoryArea();
     const session = memoryArea();
     const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
