@@ -1,5 +1,4 @@
 import { mapWithConcurrency } from './asyncPool';
-import { advanceAttempt } from './attempts';
 import { retainAttemptLedger } from './attemptLedger';
 import { deriveManagedTasks, isRetryableTaskAttempt, validateTaskGraph } from './taskGraph';
 import { markReplyObserved, persistAttempt, readWorkState, replaceWorkState, serializeStateMutation, transitionAttempt, workState, type WorkState } from './backgroundWorkState';
@@ -12,7 +11,8 @@ import { defaultCompletionPolicy, DEFAULT_MAX_REVIEW_ROUNDS, normalizeTask } fro
 import { parseReviewResult } from './review';
 import { assertMessageDeliveryAvailable, buildSemanticMessagePrompt, createAgentMessage, planMessageDispatch } from './messageBus';
 import { createPortableManagerState, parsePortableManagerState, restorePortableAttempts, stringifyPortableManagerState } from './stateTransfer';
-import { recoverAttempt, type AttemptRecoveryObservation } from './recovery';
+import type { AttemptRecoveryObservation } from './recovery';
+import { applyRestartRecovery, restartRecoveryCandidates } from './restartRecoveryPolicy';
 import { beginNativeAgentRollover, dispatchNativeBrowserOperation, planNativeBrowserOperation, mutateNativeWorkDocument, readNativeControlSnapshot, readNativeWorkSnapshot, replaceNativeWorkState, reportNativeAgentBrowser, reportNativeBrowserRuntime, reconcileNativeElasticFleet, settleNativeBrowserOperation } from './nativeControl';
 import { planFleetReconciliation, workerRequestMessage } from './fleet';
 import { bootstrapPendingConversationRollover, bootstrapReplyAttemptId, completeConversationRolloverForReply, requestAutomaticConversationRollover } from './conversationRollover';
@@ -69,34 +69,23 @@ const bindingRegistry = createBindingRegistry(
 const fleetTabs = new FleetTabRegistry(chrome.storage.session);
 
 async function reconcileAfterRestart(): Promise<void> {
-  const state = await workState();
-  const active = state.attempts.filter((attempt) =>
-    attempt.state === 'prepared' || attempt.state === 'dispatched' || attempt.state === 'acknowledged',
-  );
+  const active = restartRecoveryCandidates((await workState()).attempts);
   if (active.length === 0) return;
 
   const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*'] });
   const observations = (await mapWithConcurrency(tabs, MAX_PARALLEL_BROWSER_PROBES, recoveryStateForTab)).filter(
     (value): value is AttemptRecoveryObservation => value !== undefined,
   );
-  const control = await readNativeControlSnapshot().catch(() => undefined); if (control) for (const observation of observations) { const key = control.agents.find((agent) => agent.browserTabId === observation.tabId)?.conversationKey; if (key) observation.authoritativeConversationKey = key; }
-  const byTab = new Map(observations.map((observation) => [observation.tabId, observation]));
+  const control = await readNativeControlSnapshot().catch(() => undefined);
+  if (control) for (const observation of observations) {
+    const key = control.agents.find((agent) => agent.browserTabId === observation.tabId)?.conversationKey;
+    if (key) observation.authoritativeConversationKey = key;
+  }
 
   await serializeStateMutation(async () => {
     const current = await readWorkState();
-    let attempts = current.attempts;
-    let changed = false;
-    for (const record of active) {
-      const latest = attempts.find((attempt) => attempt.attemptId === record.attemptId);
-      if (!latest || latest.state !== record.state) continue;
-      const decision = recoverAttempt(latest, byTab.get(latest.tabId));
-      if (!decision.nextState) continue;
-      const next = advanceAttempt(latest, decision.nextState, Date.now(), decision.error);
-      if (next.state === latest.state && next.error === latest.error) continue;
-      attempts = retainAttemptLedger([...attempts.filter((attempt) => attempt.attemptId !== next.attemptId), next], current.tasks, current.messages);
-      changed = true;
-    }
-    if (changed) await replaceWorkState(current, { attempts });
+    const attempts = applyRestartRecovery(current, active, observations);
+    if (attempts) await replaceWorkState(current, { attempts });
   });
 }
 
