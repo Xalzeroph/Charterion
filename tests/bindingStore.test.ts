@@ -3,14 +3,19 @@ import { createBindingStore } from '../src/bindingStore';
 
 function memoryArea(initial: Record<string, unknown> = {}) {
   let values = { ...initial };
+  let reads = 0;
   let writes = 0;
   return {
-    get: async (key: string) => ({ [key]: values[key] }),
+    get: async (key: string) => {
+      reads += 1;
+      return { [key]: values[key] };
+    },
     set: async (items: Record<string, unknown>) => {
       values = { ...values, ...items };
       writes += 1;
     },
     read: () => values,
+    reads: () => reads,
     writes: () => writes,
   };
 }
@@ -64,8 +69,35 @@ describe('binding store', () => {
     await store.update(7, 'url:https://chatgpt.com/', binding);
 
     expect(session.read().tabs).toEqual({ '7': binding });
+    expect(local.reads()).toBe(0);
     expect(local.writes()).toBe(0);
     expect(session.writes()).toBe(1);
+  });
+
+  it('turns repeated provisional updates into storage no-ops', async () => {
+    const binding = { role: 'A', project: 'P', notes: '', agentSlotId: 'slot-1' };
+    const local = memoryArea();
+    const session = memoryArea({ tabs: { '7': binding } });
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+
+    await store.update(7, 'url:https://chatgpt.com/', { ...binding });
+
+    expect(local.reads()).toBe(0);
+    expect(local.writes()).toBe(0);
+    expect(session.reads()).toBe(1);
+    expect(session.writes()).toBe(0);
+  });
+
+  it('does not rewrite unchanged canonical bindings or empty session state', async () => {
+    const binding = { role: 'A', project: 'P', notes: '' };
+    const local = memoryArea({ bindings: { 'conversation:two': binding } });
+    const session = memoryArea({ tabs: {} });
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+
+    await store.update(7, 'conversation:two', { ...binding });
+
+    expect(local.writes()).toBe(0);
+    expect(session.writes()).toBe(0);
   });
 
   it('does not rewrite session storage when a canonical update has no temporary binding', async () => {
@@ -79,6 +111,32 @@ describe('binding store', () => {
     expect(local.read().bindings).toEqual({ 'conversation:two': binding });
     expect(local.writes()).toBe(1);
     expect(session.writes()).toBe(0);
+  });
+
+  it('reads only persistent storage for conversation-only clears', async () => {
+    const local = memoryArea({ bindings: { 'conversation:two': { role: 'A', project: 'P', notes: '' } } });
+    const session = memoryArea({ tabs: { '7': { role: 'B', project: 'P', notes: '' } } });
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+
+    await store.clear('conversation:two', undefined);
+
+    expect(local.reads()).toBe(1);
+    expect(local.writes()).toBe(1);
+    expect(session.reads()).toBe(0);
+    expect(session.writes()).toBe(0);
+  });
+
+  it('reads only session storage for tab-only clears', async () => {
+    const local = memoryArea({ bindings: { 'conversation:two': { role: 'A', project: 'P', notes: '' } } });
+    const session = memoryArea({ tabs: { '7': { role: 'B', project: 'P', notes: '' } } });
+    const store = createBindingStore({ local, session }, { persistent: 'bindings', ephemeral: 'tabs' });
+
+    await store.clear(undefined, 7);
+
+    expect(local.reads()).toBe(0);
+    expect(local.writes()).toBe(0);
+    expect(session.reads()).toBe(1);
+    expect(session.writes()).toBe(1);
   });
 
   it('clears only stores that actually contain the requested binding', async () => {
