@@ -5,7 +5,7 @@ import { deriveManagedTasks, isRetryableTaskAttempt, validateTaskGraph } from '.
 import { markReplyObserved, persistAttempt, readWorkState, replaceWorkState, serializeStateMutation, transitionAttempt, workState, type WorkState } from './backgroundWorkState';
 import { dispatchReadyManagedTasks } from './taskDispatchRuntime';
 import { hasOrganizationExecutionTask, markOrganizationExecutionObserved } from './organizationWorkAutomation';
-import { attemptBelongsToTab } from './tabAttempt';
+import { projectManagedTabs } from './managedTabProjection';
 import { applyHumanDecision, applyTaskDisposition } from './taskLifecycle';
 import { applyReviewRemediation } from './reviewLoop';
 import { defaultCompletionPolicy, DEFAULT_MAX_REVIEW_ROUNDS, normalizeTask } from './taskPolicy';
@@ -137,27 +137,18 @@ async function managedTabs(attempts?: readonly SendAttemptRecord[]): Promise<Man
   if (candidates.length === 0) return [];
   const ledger = attempts ?? currentState?.attempts ?? [];
   const observed = await mapWithConcurrency(candidates, MAX_PARALLEL_BROWSER_PROBES, async (tab) => ({
-    tab,
+    tabId: tab.id,
+    windowId: tab.windowId,
+    active: tab.active,
     snapshot: await snapshotForTab(tab),
   }));
   return serializeBindingMutation(async () => {
     const stores = await bindingStore.read();
-    const managed = observed
-      .sort((a, b) => a.tab.id - b.tab.id)
-      .map(({ tab, snapshot }) => {
-        const lastAttempt = [...ledger].reverse().find((attempt) =>
-          attemptBelongsToTab(attempt, tab.id, snapshot),
-        );
-        const result: ManagedTab = {
-          tabId: tab.id,
-          windowId: tab.windowId,
-          active: tab.active,
-          snapshot,
-          binding: bindingStore.resolve(tab.id, snapshot, stores),
-        };
-        if (lastAttempt) result.lastAttempt = lastAttempt;
-        return result;
-      });
+    const managed = projectManagedTabs(
+      observed,
+      ledger,
+      (tabId, snapshot) => bindingStore.resolve(tabId, snapshot, stores),
+    );
     await bindingStore.persist(stores);
     return managed;
   });
