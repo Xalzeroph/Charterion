@@ -46,6 +46,16 @@ function parseBindingMap(value: unknown): Record<string, RoleBinding> {
   return result;
 }
 
+function sameBinding(left: RoleBinding | undefined, right: RoleBinding): boolean {
+  return Boolean(
+    left &&
+    left.role === right.role &&
+    left.project === right.project &&
+    left.notes === right.notes &&
+    left.agentSlotId === right.agentSlotId,
+  );
+}
+
 export function createBindingStore(storage: BindingStorage, keys: BindingKeys) {
   async function readPersistent(): Promise<Record<string, RoleBinding>> {
     const stored = await storage.local.get(keys.persistent);
@@ -93,28 +103,48 @@ export function createBindingStore(storage: BindingStorage, keys: BindingKeys) {
     const tabKey = String(tabId);
     if (!conversationKey.startsWith('conversation:')) {
       const ephemeral = await readEphemeral();
+      if (sameBinding(ephemeral[tabKey], binding)) return;
       ephemeral[tabKey] = binding;
       await writeEphemeral(ephemeral);
       return;
     }
 
     const [persistent, ephemeral] = await Promise.all([readPersistent(), readEphemeral()]);
-    persistent[conversationKey] = binding;
+    const persistentChanged = !sameBinding(persistent[conversationKey], binding);
+    if (persistentChanged) persistent[conversationKey] = binding;
     const hadTemporary = Object.hasOwn(ephemeral, tabKey);
     if (hadTemporary) delete ephemeral[tabKey];
     await Promise.all([
-      writePersistent(persistent),
+      ...(persistentChanged ? [writePersistent(persistent)] : []),
       ...(hadTemporary ? [writeEphemeral(ephemeral)] : []),
     ]);
   }
 
   async function clear(conversationKey: string | undefined, tabId: number | undefined): Promise<void> {
-    const [persistent, ephemeral] = await Promise.all([readPersistent(), readEphemeral()]);
-    const persistentChanged = Boolean(conversationKey && Object.hasOwn(persistent, conversationKey));
+    const hasConversation = Boolean(conversationKey);
     const tabKey = tabId === undefined ? undefined : String(tabId);
-    const ephemeralChanged = Boolean(tabKey !== undefined && Object.hasOwn(ephemeral, tabKey));
-    if (conversationKey && persistentChanged) delete persistent[conversationKey];
-    if (tabKey !== undefined && ephemeralChanged) delete ephemeral[tabKey];
+    if (!hasConversation && tabKey === undefined) return;
+
+    if (hasConversation && tabKey === undefined) {
+      const persistent = await readPersistent();
+      if (!Object.hasOwn(persistent, conversationKey!)) return;
+      delete persistent[conversationKey!];
+      await writePersistent(persistent);
+      return;
+    }
+    if (!hasConversation && tabKey !== undefined) {
+      const ephemeral = await readEphemeral();
+      if (!Object.hasOwn(ephemeral, tabKey)) return;
+      delete ephemeral[tabKey];
+      await writeEphemeral(ephemeral);
+      return;
+    }
+
+    const [persistent, ephemeral] = await Promise.all([readPersistent(), readEphemeral()]);
+    const persistentChanged = Object.hasOwn(persistent, conversationKey!);
+    const ephemeralChanged = Object.hasOwn(ephemeral, tabKey!);
+    if (persistentChanged) delete persistent[conversationKey!];
+    if (ephemeralChanged) delete ephemeral[tabKey!];
     await Promise.all([
       ...(persistentChanged ? [writePersistent(persistent)] : []),
       ...(ephemeralChanged ? [writeEphemeral(ephemeral)] : []),
