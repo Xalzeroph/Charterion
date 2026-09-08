@@ -19,13 +19,12 @@ import { bootstrapPendingConversationRollover, bootstrapReplyAttemptId, complete
 import { deriveBrowserRuntimeObservation, fleetExpansionAllowed } from './browserRuntime';
 import { CoalescingRunner } from './coalescingRunner';
 import { TabOperationQueue } from './tabOperationQueue';
-import { MutationLane } from './mutationLane';
 import { FleetTabRegistry } from './fleetTabRegistry';
 import { RUNTIME_STORAGE_KEYS } from './runtimeStorageKeys';
 import { controlFeedbackMessages } from './controlFeedback';
 import { ContentRuntimeFence } from './contentRuntimeFence';
 import { browserOperationPolicy } from './browserOperationPolicy';
-import { createBindingStore } from './bindingStore';
+import { createBindingRegistry } from './bindingRegistry';
 import { recoveryStateForTab, snapshotForTab } from './contentRuntimeBridge';
 import { reportIncident, reportSlotRuntime, sha256Text } from './browserRuntimeReporting';
 import { PROMPT_DISPATCH_GOVERNOR_KEY, PromptDispatchGovernor } from './promptDispatchGovernor';
@@ -55,18 +54,13 @@ const {
 const CONTROL_REQUEST_MESSAGE_PREFIX = 'control-request:';
 const MAX_PARALLEL_BROWSER_PROBES = 6;
 const MAX_PARALLEL_TAB_DISPATCHES = 4;
-const bindingMutationLane = new MutationLane();
 const tabOperations = new TabOperationQueue();
 const contentRuntimeFence = new ContentRuntimeFence();
 const promptDispatchGovernor = new PromptDispatchGovernor({
   read: async () => (await chrome.storage.local.get(PROMPT_DISPATCH_GOVERNOR_KEY))[PROMPT_DISPATCH_GOVERNOR_KEY],
   write: async (state) => { await chrome.storage.local.set({ [PROMPT_DISPATCH_GOVERNOR_KEY]: state }); },
 });
-function serializeBindingMutation<T>(operation: () => Promise<T>): Promise<T> {
-  return bindingMutationLane.run(operation);
-}
-
-const bindingStore = createBindingStore(
+const bindingRegistry = createBindingRegistry(
   { local: chrome.storage.local, session: chrome.storage.session },
   { persistent: BINDINGS_KEY, ephemeral: TAB_BINDINGS_KEY },
 );
@@ -107,12 +101,7 @@ async function reconcileAfterRestart(): Promise<void> {
 }
 
 async function bindingFor(tabId: number, snapshot: ChatSnapshot): Promise<RoleBinding> {
-  return serializeBindingMutation(async () => {
-    const stores = await bindingStore.read();
-    const binding = bindingStore.resolve(tabId, snapshot, stores);
-    await bindingStore.persist(stores);
-    return binding;
-  });
+  return bindingRegistry.resolve(tabId, snapshot);
 }
 
 async function managedTabs(attempts?: readonly SendAttemptRecord[]): Promise<ManagedTab[]> {
@@ -129,20 +118,11 @@ async function managedTabs(attempts?: readonly SendAttemptRecord[]): Promise<Man
     active: tab.active,
     snapshot: await snapshotForTab(tab),
   }));
-  return serializeBindingMutation(async () => {
-    const stores = await bindingStore.read();
-    const managed = projectManagedTabs(
-      observed,
-      ledger,
-      (tabId, snapshot) => bindingStore.resolve(tabId, snapshot, stores),
-    );
-    await bindingStore.persist(stores);
-    return managed;
-  });
+  return bindingRegistry.project((resolveBinding) => projectManagedTabs(observed, ledger, resolveBinding));
 }
 
 async function updateBinding(tabId: number, conversationKey: string, binding: RoleBinding): Promise<void> {
-  await serializeBindingMutation(() => bindingStore.update(tabId, conversationKey, binding));
+  await bindingRegistry.update(tabId, conversationKey, binding);
 }
 
 async function prepareAttempt(
@@ -486,13 +466,13 @@ async function retryReviewLoop(taskId: string): Promise<{ reviewTask: AgentTask;
 }
 
 async function exportStateDocument(): Promise<string> {
-  const [bindings, state, enabled] = await Promise.all([bindingStore.readPersistent(), workState(), supervisorEnabled()]);
+  const [bindings, state, enabled] = await Promise.all([bindingRegistry.readPersistent(), workState(), supervisorEnabled()]);
   return stringifyPortableManagerState(createPortableManagerState(bindings, state.tasks, state.attempts, state.messages, enabled));
 }
 
 async function importStateDocument(document: string): Promise<void> {
   const imported = parsePortableManagerState(document);
-  await serializeBindingMutation(async () => {
+  await bindingRegistry.run(async () => {
     await serializeStateMutation(async () => {
       const current = await readWorkState();
       await replaceWorkState(current, {
@@ -586,7 +566,7 @@ function scheduleBrowserRuntimeReport(): void {
 let fleetReconcileTimer: number | undefined;
 
 async function clearFleetBinding(conversationKey: string | undefined, tabId: number | undefined): Promise<void> {
-  await serializeBindingMutation(() => bindingStore.clear(conversationKey, tabId));
+  await bindingRegistry.clear(conversationKey, tabId);
 }
 
 async function syncWorkerRequestMessages(snapshot: import('./nativeControl').NativeControlSnapshot): Promise<void> {
@@ -882,15 +862,9 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   contentRuntimeFence.remove(tabId);
   void fleetTabs.run(async () => {
-    const [mapping, bindingChanged] = await Promise.all([
+    const [mapping] = await Promise.all([
       fleetTabs.read(),
-      serializeBindingMutation(async () => {
-        const bindings = await bindingStore.readEphemeral();
-        if (bindings[String(tabId)] === undefined) return false;
-        delete bindings[String(tabId)];
-        await bindingStore.writeEphemeral(bindings);
-        return true;
-      }),
+      bindingRegistry.clear(undefined, tabId),
     ]);
     let mappingChanged = false;
     for (const [slotId, mappedTabId] of Object.entries(mapping)) {
