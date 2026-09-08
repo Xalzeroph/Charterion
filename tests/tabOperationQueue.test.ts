@@ -29,4 +29,31 @@ describe('TabOperationQueue', () => {
     expect(order).toEqual(['first:start', 'first:end', 'second:start']);
     expect(queue.pending(7)).toBe(false);
   });
+
+  it('does not let a failed operation poison the next operation on the same tab', async () => {
+    const queue = new TabOperationQueue();
+    const first = queue.run(7, async () => { throw new Error('boom'); });
+    const second = queue.run(7, async () => 2);
+
+    await expect(first).rejects.toThrow('boom');
+    await expect(second).resolves.toBe(2);
+    expect(queue.pending(7)).toBe(false);
+  });
+
+  it('runs different tab lanes independently', async () => {
+    const queue = new TabOperationQueue();
+    let releaseSeven!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseSeven = resolve; });
+    let tabNineCompleted = false;
+
+    const tabSeven = queue.run(7, async () => { await gate; return 7; });
+    const tabNine = queue.run(9, async () => { tabNineCompleted = true; return 9; });
+
+    await tabNine;
+    expect(tabNineCompleted).toBe(true);
+    expect(queue.pending(7)).toBe(true);
+    releaseSeven();
+    await expect(tabSeven).resolves.toBe(7);
+    expect(queue.pending(7)).toBe(false);
+  });
 });
