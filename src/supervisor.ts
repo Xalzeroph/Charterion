@@ -27,20 +27,46 @@ function candidateScore(task: AgentTask, tab: ManagedTab): number | undefined {
   return score;
 }
 
+interface TaskCandidate {
+  tab: ManagedTab;
+  score: number;
+}
+
 interface TaskCandidates {
   managed: ManagedTask;
   index: number;
-  candidates: Array<{ tab: ManagedTab; score: number }>;
+  candidates: TaskCandidate[];
 }
+
+function candidatesForTask(task: AgentTask, tabs: readonly ManagedTab[]): TaskCandidate[] {
+  const candidates: TaskCandidate[] = [];
+  for (const tab of tabs) {
+    const score = candidateScore(task, tab);
+    if (score !== undefined) candidates.push({ tab, score });
+  }
+  return candidates;
+}
+
+function betterCandidate(
+  candidate: TaskCandidate,
+  current: TaskCandidate | undefined,
+  tabFlexibility: ReadonlyMap<number, number>,
+): boolean {
+  if (!current) return true;
+  if (candidate.score !== current.score) return candidate.score > current.score;
+  const candidateFlexibility = tabFlexibility.get(candidate.tab.tabId) ?? 0;
+  const currentFlexibility = tabFlexibility.get(current.tab.tabId) ?? 0;
+  if (candidateFlexibility !== currentFlexibility) return candidateFlexibility < currentFlexibility;
+  return candidate.tab.tabId < current.tab.tabId;
+}
+
 export function planReadyDispatches(tasks: readonly ManagedTask[], tabs: readonly ManagedTab[]): DispatchDecision[] {
-  const ready: TaskCandidates[] = tasks.flatMap((managed, index) => {
-    if (managed.status !== 'ready') return [];
-    const candidates = tabs
-      .map((tab) => ({ tab, score: candidateScore(managed.task, tab) }))
-      .filter((item): item is { tab: ManagedTab; score: number } => item.score !== undefined)
-      .sort((left, right) => right.score - left.score || left.tab.tabId - right.tab.tabId);
-    return [{ managed, index, candidates }];
-  });
+  const ready: TaskCandidates[] = [];
+  for (let index = 0; index < tasks.length; index += 1) {
+    const managed = tasks[index]!;
+    if (managed.status !== 'ready') continue;
+    ready.push({ managed, index, candidates: candidatesForTask(managed.task, tabs) });
+  }
 
   // Minimum-remaining-values first prevents a flexible task from consuming
   // the only compatible tab for a constrained task.
@@ -61,13 +87,11 @@ export function planReadyDispatches(tasks: readonly ManagedTask[], tabs: readonl
   );
 
   for (const item of allocationOrder) {
-    const selected = item.candidates
-      .filter((candidate) => !claimedTabs.has(candidate.tab.tabId))
-      .sort((left, right) =>
-        right.score - left.score ||
-        (tabFlexibility.get(left.tab.tabId) ?? 0) - (tabFlexibility.get(right.tab.tabId) ?? 0) ||
-        left.tab.tabId - right.tab.tabId
-      )[0];
+    let selected: TaskCandidate | undefined;
+    for (const candidate of item.candidates) {
+      if (claimedTabs.has(candidate.tab.tabId)) continue;
+      if (betterCandidate(candidate, selected, tabFlexibility)) selected = candidate;
+    }
 
     if (!selected) {
       selectedByIndex.set(item.index, {
@@ -82,8 +106,10 @@ export function planReadyDispatches(tasks: readonly ManagedTask[], tabs: readonl
 
   // Allocation is optimized independently of input order, while the result
   // remains stable for callers and preserves deterministic dispatch output.
-  return tasks.flatMap((_, index) => {
+  const decisions: DispatchDecision[] = [];
+  for (let index = 0; index < tasks.length; index += 1) {
     const decision = selectedByIndex.get(index);
-    return decision ? [decision] : [];
-  });
+    if (decision) decisions.push(decision);
+  }
+  return decisions;
 }
