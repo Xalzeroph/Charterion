@@ -1,5 +1,5 @@
 import type { AgentMessage } from './contracts';
-import type { NativeControlSnapshot } from './nativeControl';
+import type { ControlReviewView, NativeControlSnapshot } from './nativeControl';
 
 export const CONTROL_REVIEW_FEEDBACK_PREFIX = 'control-review-feedback:';
 export const CONTROL_MERGE_FAILURE_PREFIX = 'control-merge-failure:';
@@ -20,6 +20,20 @@ function messageBase(
   };
 }
 
+function reviewKey(changeRequestId: string, headSha: string): string {
+  return `${changeRequestId}\u0000${headSha}`;
+}
+
+function latestReviews(snapshot: NativeControlSnapshot): Map<string, ControlReviewView> {
+  const latest = new Map<string, ControlReviewView>();
+  for (const review of snapshot.reviews) {
+    const key = reviewKey(review.changeRequestId, review.headSha);
+    const current = latest.get(key);
+    if (!current || review.createdAt >= current.createdAt) latest.set(key, review);
+  }
+  return latest;
+}
+
 export function controlFeedbackMessages(
   snapshot: NativeControlSnapshot,
   existingIds: ReadonlySet<string> = new Set(),
@@ -27,6 +41,7 @@ export function controlFeedbackMessages(
   const projects = new Map(snapshot.projects.map((project) => [project.id, project]));
   const agents = new Map(snapshot.agents.map((agent) => [agent.id, agent]));
   const changes = new Map(snapshot.changeRequests.map((change) => [change.id, change]));
+  const reviews = latestReviews(snapshot);
   const result: AgentMessage[] = [];
 
   for (const change of snapshot.changeRequests) {
@@ -34,10 +49,7 @@ export function controlFeedbackMessages(
     const author = agents.get(change.authorSubject);
     const project = projects.get(change.projectId);
     if (!author || !project) continue;
-    const latestReview = snapshot.reviews
-      .filter((review) => review.changeRequestId === change.id && review.headSha === change.headSha)
-      .sort((left, right) => left.createdAt - right.createdAt)
-      .at(-1);
+    const latestReview = reviews.get(reviewKey(change.id, change.headSha));
     if (!latestReview || latestReview.verdict !== 'request-changes') continue;
     const id = `${CONTROL_REVIEW_FEEDBACK_PREFIX}${latestReview.id}`;
     if (existingIds.has(id)) continue;
