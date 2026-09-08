@@ -9,10 +9,14 @@ import {
 
 function memoryStore(initial?: unknown) {
   let value = initial;
+  let reads = 0;
+  let writes = 0;
   return {
-    read: async () => structuredClone(value),
-    write: async (next: PromptDispatchGovernorState) => { value = structuredClone(next); },
+    read: async () => { reads += 1; return structuredClone(value); },
+    write: async (next: PromptDispatchGovernorState) => { value = structuredClone(next); writes += 1; },
     value: () => structuredClone(value) as PromptDispatchGovernorState | undefined,
+    reads: () => reads,
+    writes: () => writes,
   };
 }
 
@@ -48,6 +52,18 @@ describe('PromptDispatchGovernor', () => {
     expect(h.store.value()?.recentDispatches).toEqual([1_000_000, 1_004_000]);
   });
 
+  it('keeps short-wait burst contenders moving without holding the serialization lane', async () => {
+    const h = harness();
+    const permits = await Promise.all([
+      h.governor.acquire({ project: 'P1', slotId: 'S1', activeGenerations: 0 }),
+      h.governor.acquire({ project: 'P2', slotId: 'S2', activeGenerations: 0 }),
+      h.governor.acquire({ project: 'P3', slotId: 'S3', activeGenerations: 0 }),
+    ]);
+    expect(permits.every((permit) => permit.allowed)).toBe(true);
+    const reserved = permits.flatMap((permit) => permit.allowed ? [permit.reservedAt] : []).sort((a, b) => a - b);
+    expect(reserved).toEqual([1_000_000, 1_004_000, 1_008_000]);
+  });
+
   it('does not hold the global serialization lane while an acquire is sleeping', async () => {
     let now = 1_000_000;
     const store = memoryStore();
@@ -78,6 +94,16 @@ describe('PromptDispatchGovernor', () => {
     releaseSleep();
     const second = await secondPending;
     expect(second).toMatchObject({ allowed: false, reason: 'rate-limit-backoff' });
+  });
+
+  it('hydrates persisted pacing state once and then uses a write-through cache', async () => {
+    const h = harness();
+    expect((await h.governor.acquire({ project: 'P1', slotId: 'S1', activeGenerations: 0 })).allowed).toBe(true);
+    h.advance(DEFAULT_PROMPT_DISPATCH_POLICY.globalMinIntervalMs);
+    expect((await h.governor.acquire({ project: 'P2', slotId: 'S2', activeGenerations: 0 })).allowed).toBe(true);
+    await h.governor.noteRateLimit();
+    expect(h.store.reads()).toBe(1);
+    expect(h.store.writes()).toBe(3);
   });
 
   it('defers instead of blocking when the rolling budget needs a long wait', async () => {
