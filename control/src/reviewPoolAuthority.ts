@@ -166,6 +166,8 @@ export class ReviewPoolAuthority {
       if (!this.eligible(request, slot, input.reviewerAgentId)) throw new Error('Reviewer is not eligible for this review slot');
       this.database.db.prepare("UPDATE review_slots SET state='claimed',reviewer_agent_id=?,claimed_at=? WHERE id=? AND state='open'")
         .run(input.reviewerAgentId, now, slot.id);
+      this.database.db.prepare("UPDATE organization_review_work_items SET status='claimed',updated_at=? WHERE review_slot_id=? AND status='materialized'")
+        .run(now, slot.id);
       const claimed = this.getSlot(slot.id);
       if (claimed.reviewerAgentId !== input.reviewerAgentId || claimed.state !== 'claimed') throw new Error('Review slot claim lost a concurrency race');
       this.event(request.projectId, 'REVIEW_SLOT_CLAIMED', slot.id, { reviewRequestId: request.id, reviewerAgentId: input.reviewerAgentId, dimension: slot.dimension }, now);
@@ -195,6 +197,8 @@ export class ReviewPoolAuthority {
       const state: ReviewSlotState = input.decision === 'approve' ? 'approved' : input.decision === 'request-changes' ? 'changes-requested' : 'rejected';
       this.database.db.prepare('UPDATE review_slots SET state=?,decided_at=?,decision_note=? WHERE id=?')
         .run(state, now, note, slot.id);
+      this.database.db.prepare("UPDATE organization_review_work_items SET status='decided',updated_at=? WHERE review_slot_id=? AND status IN ('materialized','claimed')")
+        .run(now, slot.id);
       this.event(request.projectId, 'REVIEW_SLOT_DECIDED', slot.id, { reviewRequestId: request.id, reviewerAgentId: input.reviewerAgentId, dimension: slot.dimension, decision: input.decision }, now);
       return { slot: this.getSlot(slot.id), request: this.reconcile(request.id, now) };
     });
