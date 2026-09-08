@@ -3,8 +3,11 @@ import { parseStructuredTaskResult } from './structuredResult';
 import { DEFAULT_MAX_REVIEW_ROUNDS, validateTaskPolicy } from './taskPolicy';
 import type { AgentTask, ManagedTask, ReviewResult, SendAttemptRecord, StructuredTaskResult, TaskDisplayStatus } from './contracts';
 
+const BLOCKING_DEPENDENCY_STATES = new Set<TaskDisplayStatus>(['error', 'attention', 'blocked', 'cancelled', 'rejected']);
+
 export function validateTaskGraph(tasks: readonly AgentTask[]): void {
-  const byId = new Map(tasks.map((task) => [task.id, task]));
+  const byId = new Map<string, AgentTask>();
+  for (const task of tasks) byId.set(task.id, task);
   if (byId.size !== tasks.length) throw new Error('Task ids must be unique');
   for (const task of tasks) {
     if (!task.title.trim() || !task.instruction.trim()) {
@@ -30,13 +33,15 @@ export function validateTaskGraph(tasks: readonly AgentTask[]): void {
   for (const task of tasks) visit(task.id);
 }
 
-function evaluateAttempt(task: AgentTask, attempt: SendAttemptRecord | undefined): {
+interface AttemptEvaluation {
   status?: TaskDisplayStatus;
   reviewResult?: ReviewResult;
   reviewError?: string;
   structuredResult?: StructuredTaskResult;
   structuredResultError?: string;
-} {
+}
+
+function evaluateAttempt(task: AgentTask, attempt: SendAttemptRecord | undefined): AttemptEvaluation {
   if (task.completionPolicy === 'verified-claim' && task.machineCompletion) return { status: 'completed' };
   switch (attempt?.state) {
     case 'reply-observed': {
@@ -67,17 +72,25 @@ function reviewAttemptsExhausted(task: AgentTask): boolean {
     task.attemptIds.length >= (task.maxReviewRounds ?? DEFAULT_MAX_REVIEW_ROUNDS);
 }
 
-export function isRetryableTaskAttempt(task: AgentTask, attempt: SendAttemptRecord | undefined): boolean {
+function isRetryableEvaluatedAttempt(
+  task: AgentTask,
+  attempt: SendAttemptRecord | undefined,
+  evaluation: AttemptEvaluation,
+  reviewExhausted = reviewAttemptsExhausted(task),
+): boolean {
   if (!attempt) return false;
   if (attempt.state === 'failed' || attempt.state === 'uncertain') {
-    return task.kind !== 'review' || !reviewAttemptsExhausted(task);
+    return task.kind !== 'review' || !reviewExhausted;
   }
   if (attempt.state === 'reply-observed' && task.completionPolicy === 'structured-result') {
-    return !parseStructuredTaskResult(attempt.replyTextTail ?? '').ok;
+    return evaluation.structuredResultError !== undefined;
   }
-  if (task.kind !== 'review' || attempt.state !== 'reply-observed' || reviewAttemptsExhausted(task)) return false;
-  const parsed = parseReviewResult(attempt.replyTextTail ?? '');
-  return !parsed.ok || parsed.result.decision === 'fail';
+  if (task.kind !== 'review' || attempt.state !== 'reply-observed' || reviewExhausted) return false;
+  return evaluation.reviewError !== undefined || evaluation.reviewResult?.decision === 'fail';
+}
+
+export function isRetryableTaskAttempt(task: AgentTask, attempt: SendAttemptRecord | undefined): boolean {
+  return isRetryableEvaluatedAttempt(task, attempt, evaluateAttempt(task, attempt));
 }
 
 function isReviewRevisionRetry(task: AgentTask, attempt: SendAttemptRecord | undefined): boolean {
@@ -89,32 +102,42 @@ function isReviewRevisionRetry(task: AgentTask, attempt: SendAttemptRecord | und
   );
 }
 
+function attemptHistoryForTask(task: AgentTask, attemptsById: ReadonlyMap<string, SendAttemptRecord>): SendAttemptRecord[] {
+  const history: SendAttemptRecord[] = [];
+  for (const id of task.attemptIds) {
+    const attempt = attemptsById.get(id);
+    if (attempt) history.push(attempt);
+  }
+  return history;
+}
+
 export function deriveManagedTasks(
   tasks: readonly AgentTask[],
   attempts: readonly SendAttemptRecord[],
 ): ManagedTask[] {
-  const tasksById = new Map(tasks.map((task) => [task.id, task]));
-  const attemptsById = new Map(attempts.map((attempt) => [attempt.attemptId, attempt]));
+  const tasksById = new Map<string, AgentTask>();
+  for (const task of tasks) tasksById.set(task.id, task);
+  const attemptsById = new Map<string, SendAttemptRecord>();
+  for (const attempt of attempts) attemptsById.set(attempt.attemptId, attempt);
   const result = new Map<string, ManagedTask>();
 
   const derive = (task: AgentTask): ManagedTask => {
     const cached = result.get(task.id);
     if (cached) return cached;
-    const attemptHistory = task.attemptIds
-      .map((id) => attemptsById.get(id))
-      .filter((attempt): attempt is SendAttemptRecord => attempt !== undefined);
+    const attemptHistory = attemptHistoryForTask(task, attemptsById);
     const lastAttempt = attemptHistory.at(-1);
+    const observedEvaluation = evaluateAttempt(task, lastAttempt);
+    const reviewExhausted = reviewAttemptsExhausted(task);
     const retryRequested = Boolean(
       lastAttempt &&
       task.retryAfterAttemptId === lastAttempt.attemptId &&
-      (isRetryableTaskAttempt(task, lastAttempt) || isReviewRevisionRetry(task, lastAttempt)),
+      (isRetryableEvaluatedAttempt(task, lastAttempt, observedEvaluation, reviewExhausted) || isReviewRevisionRetry(task, lastAttempt)),
     );
-    const observedEvaluation = evaluateAttempt(task, lastAttempt);
     const evaluation = retryRequested ? {} : observedEvaluation;
     const reviewLoopExhausted = Boolean(
       task.kind === 'review' &&
       evaluation.status === 'attention' &&
-      reviewAttemptsExhausted(task),
+      reviewExhausted,
     );
 
     let status: TaskDisplayStatus;
@@ -127,13 +150,21 @@ export function deriveManagedTasks(
     } else if (reviewLoopExhausted) {
       status = 'error';
     } else {
-      const dependencies = task.dependsOn
-        .map((id) => tasksById.get(id))
-        .filter((dependency): dependency is AgentTask => dependency !== undefined);
-      const dependencyStates = dependencies.map((dependency) => derive(dependency).status);
-      if (dependencyStates.some((state) => ['error', 'attention', 'blocked', 'cancelled', 'rejected'].includes(state))) {
+      let dependencyBlocked = false;
+      let dependenciesTerminal = true;
+      for (const id of task.dependsOn) {
+        const dependency = tasksById.get(id);
+        if (!dependency) continue;
+        const dependencyStatus = derive(dependency).status;
+        if (BLOCKING_DEPENDENCY_STATES.has(dependencyStatus)) {
+          dependencyBlocked = true;
+          break;
+        }
+        if (dependencyStatus !== 'completed' && dependencyStatus !== 'skipped') dependenciesTerminal = false;
+      }
+      if (dependencyBlocked) {
         status = 'blocked';
-      } else if (!dependencyStates.every((state) => state === 'completed' || state === 'skipped')) {
+      } else if (!dependenciesTerminal) {
         status = task.dependsOn.length === 0 ? 'ready' : 'pending';
       } else if (task.kind === 'human') {
         status = task.humanDecision?.decision === 'approve'
