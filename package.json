@@ -14,7 +14,7 @@
     "check": "npm run check:native-rpc-contract && npm run check:version-metadata && tsc --noEmit",
     "test": "vitest run --pool=forks --fileParallelism=false",
     "check:assets": "node scripts/check-assets.mjs",
-    "check:architecture": "node scripts/check-architecture.mjs",
+    "check:architecture": "node scripts/check-layer-boundaries.mjs && node scripts/check-architecture.mjs",
     "check:workflow-pinning": "node scripts/check-workflow-pinning.mjs",
     "check:dist": "node scripts/check-dist-fingerprint.mjs",
     "check:control": "tsc -p tsconfig.control.json --noEmit",
