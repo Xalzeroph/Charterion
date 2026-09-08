@@ -10,6 +10,8 @@ async function main(): Promise<void> {
   const browserToken = ensureBrowserToken(config);
   const database = new ControlDatabase(config.databasePath);
   const plane = new ControlPlane(database, config.gitPath);
+  const recoveredOrganizationWorkflows = plane.reconcilePersistedOrganizationWorkflows();
+  if (recoveredOrganizationWorkflows > 0) console.error(`gamd recovered organization workflows=${recoveredOrganizationWorkflows}`);
   const router = new RpcRouter(plane, adminToken, browserToken, config.instanceId);
   const server = await startIpcServer(config.pipeName, router);
 
