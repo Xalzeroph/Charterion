@@ -3,14 +3,19 @@ import { sendPersistentNativeMessage } from './nativeMessageTransport';
 import { NATIVE_CONTROL_HOST, assertNativeRpcMethod, type NativeRpcMethod } from './nativeRpcProtocol.generated';
 import {
   parseNativeControlSnapshot,
+  parseNativeTaskWorkspace,
   type AgentBrowserReportInput,
   type AgentRuntimeReportInput,
   type BrowserRuntimeReportInput,
   type NativeControlSnapshot,
+  type NativeOrganizationExecutionProjection,
+  type NativeRolloverStatus,
+  type NativeTaskWorkspace,
   type NativeWorkSnapshot,
 } from './nativeControlLegacy';
 
 const WORK_TRANSPORT_KEY = 'nativeWorkTransport.v1';
+const ROLLOVER_STATUSES = new Set(['requested', 'opening', 'bootstrapping']);
 
 export interface NativeWorkDocumentMutation {
   kind: 'task' | 'attempt' | 'message';
@@ -30,6 +35,12 @@ function stringField(value: unknown, label: string): string {
 function numberField(value: unknown, label: string): number {
   if (typeof value !== 'number' || !Number.isFinite(value)) throw new Error(`${label} must be a number`);
   return value;
+}
+
+function enumField(value: unknown, label: string, allowed: ReadonlySet<string>): string {
+  const text = stringField(value, label);
+  if (!allowed.has(text)) throw new Error(`${label} is invalid`);
+  return text;
 }
 
 function arrayField(value: unknown, label: string): unknown[] {
@@ -92,6 +103,47 @@ function parseNativeWorkSnapshot(value: unknown): NativeWorkSnapshot {
   };
 }
 
+function parseRolloverStatus(value: unknown): NativeRolloverStatus | null {
+  if (value === null) return null;
+  const root = record(value, 'rollover status');
+  const rollover = record(root.rollover, 'rollover');
+  const checkpoint = record(root.checkpoint, 'checkpoint');
+  const result: NativeRolloverStatus = {
+    rollover: {
+      id: stringField(rollover.id, 'rollover.id'),
+      slotId: stringField(rollover.slotId, 'rollover.slotId'),
+      status: enumField(rollover.status, 'rollover.status', ROLLOVER_STATUSES) as NativeRolloverStatus['rollover']['status'],
+      checkpointId: stringField(rollover.checkpointId, 'rollover.checkpointId'),
+      fromConversationKey: stringField(rollover.fromConversationKey, 'rollover.fromConversationKey'),
+      reason: stringField(rollover.reason, 'rollover.reason'),
+    },
+    checkpoint: {
+      id: stringField(checkpoint.id, 'checkpoint.id'),
+      handoffText: stringField(checkpoint.handoffText, 'checkpoint.handoffText'),
+      reason: stringField(checkpoint.reason, 'checkpoint.reason'),
+      state: record(checkpoint.state, 'checkpoint.state'),
+    },
+  };
+  if (rollover.toConversationKey !== undefined) result.rollover.toConversationKey = stringField(rollover.toConversationKey, 'rollover.toConversationKey');
+  if (rollover.bootstrapAttemptId !== undefined) result.rollover.bootstrapAttemptId = stringField(rollover.bootstrapAttemptId, 'rollover.bootstrapAttemptId');
+  return result;
+}
+
+function parseOrganizationExecutionProjection(value: unknown): NativeOrganizationExecutionProjection {
+  const item = record(value, 'organization execution projection');
+  const task = parseNativeWorkSnapshot({ revision: 0, tasks: [item.task], attempts: [], messages: [] }).tasks[0];
+  if (!task) throw new Error('organization execution projection task is missing');
+  return {
+    workItemId: stringField(item.workItemId, 'projection.workItemId'),
+    missionId: stringField(item.missionId, 'projection.missionId'),
+    organizationAgentId: stringField(item.organizationAgentId, 'projection.organizationAgentId'),
+    projectId: stringField(item.projectId, 'projection.projectId'),
+    runtimeSlotId: stringField(item.runtimeSlotId, 'projection.runtimeSlotId'),
+    managerTaskId: stringField(item.managerTaskId, 'projection.managerTaskId'),
+    task,
+  };
+}
+
 async function workTransportGeneration(): Promise<string> {
   const stored = await chrome.storage.session.get(WORK_TRANSPORT_KEY);
   const current = stored[WORK_TRANSPORT_KEY];
@@ -137,6 +189,30 @@ export async function reportNativeBrowserRuntime(input: BrowserRuntimeReportInpu
 
 export async function reportNativeAgentBrowser(input: AgentBrowserReportInput): Promise<void> {
   await persistentNativeResult('agent.browser-report', input as unknown as Record<string, unknown>);
+}
+
+export async function requestNativeAgentRollover(input: { slotId: string; reason: string; handoffText: string; state: Record<string, unknown> }): Promise<void> {
+  await persistentNativeResult('agent.rollover-request', input as unknown as Record<string, unknown>);
+}
+
+export async function beginNativeAgentRollover(slotId: string, rolloverId: string): Promise<void> {
+  await persistentNativeResult('agent.rollover-begin', { slotId, rolloverId });
+}
+
+export async function markNativeAgentRolloverBootstrap(slotId: string, rolloverId: string, attemptId: string): Promise<void> {
+  await persistentNativeResult('agent.rollover-bootstrap', { slotId, rolloverId, attemptId });
+}
+
+export async function completeNativeAgentRollover(slotId: string, attemptId: string): Promise<void> {
+  await persistentNativeResult('agent.rollover-complete', { slotId, attemptId });
+}
+
+export async function failNativeAgentRollover(slotId: string, error: string): Promise<void> {
+  await persistentNativeResult('agent.rollover-fail', { slotId, error });
+}
+
+export async function readNativeAgentRolloverStatus(slotId: string): Promise<NativeRolloverStatus | null> {
+  return parseRolloverStatus(await persistentNativeResult('agent.rollover-status', { slotId }));
 }
 
 export async function readNativeWorkSnapshot(): Promise<NativeWorkSnapshot> {
@@ -215,6 +291,14 @@ export async function batchMutateNativeWorkDocuments(input: {
   const response = await sendRetriedWorkRequest(request);
   const result = record(nativeResult(response, request.id, request.method), 'work batch mutation result');
   return numberField(result.revision, 'work batch mutation revision');
+}
+
+export async function provisionNativeTaskWorkspace(input: { projectId: string; slotId: string; taskId: string }): Promise<NativeTaskWorkspace> {
+  return parseNativeTaskWorkspace(await persistentNativeResult('workspace.provision', input));
+}
+
+export async function projectNativeOrganizationWork(workItemId: string): Promise<NativeOrganizationExecutionProjection> {
+  return parseOrganizationExecutionProjection(await persistentNativeResult('org-work.project-execution', { workItemId }));
 }
 
 export async function reconcileNativeElasticFleet(): Promise<unknown> {
