@@ -154,7 +154,7 @@ export function sendPersistentNativeMessage(host: string, request: NativeMessage
   if (!transport) {
     transport = new NativeMessageTransport(
       host,
-      (name) => chrome.runtime.connectNative(name) as NativeMessagePort,
+      (name) => chrome.runtime.connectNative(name) as unknown as NativeMessagePort,
       () => chrome.runtime.lastError?.message,
     );
     transports.set(host, transport);
