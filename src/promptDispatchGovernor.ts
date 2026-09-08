@@ -279,7 +279,9 @@ export class PromptDispatchGovernor {
 
   private async noteRateLimitSerialized(): Promise<number> {
     const now = this.clock();
-    const state = await this.readState(now);
+    const current = await this.readState(now);
+    // Mutate an isolated snapshot so a failed durable write cannot publish phantom backoff into the cache.
+    const state = normalizePromptDispatchState(current, now, this.policy);
     const withinStrikeWindow = state.lastRateLimitAt !== undefined && now - state.lastRateLimitAt <= this.policy.rateLimitStrikeResetMs;
     const strikes = withinStrikeWindow ? state.rateLimitStrikes + 1 : 1;
     const exponent = Math.min(Math.max(0, strikes - 1), 20);
