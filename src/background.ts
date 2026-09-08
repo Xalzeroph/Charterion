@@ -18,6 +18,7 @@ import { planFleetReconciliation, workerRequestMessage } from './fleet';
 import { bootstrapPendingConversationRollover, bootstrapReplyAttemptId, completeConversationRolloverForReply, requestAutomaticConversationRollover } from './conversationRollover';
 import { deriveBrowserRuntimeObservation, fleetExpansionAllowed } from './browserRuntime';
 import { CoalescingRunner } from './coalescingRunner';
+import { ScheduledTrigger } from './scheduledTrigger';
 import { TabOperationQueue } from './tabOperationQueue';
 import { FleetTabRegistry } from './fleetTabRegistry';
 import { RUNTIME_STORAGE_KEYS } from './runtimeStorageKeys';
@@ -530,7 +531,6 @@ async function focusTab(tabId: number): Promise<void> {
   await chrome.windows.update(tab.windowId, { focused: true });
 }
 
-let browserReportTimer: number | undefined;
 
 async function reportBrowserRuntimeFromTabs(tabs: ManagedTab[]): Promise<void> {
   const runtime = deriveBrowserRuntimeObservation(tabs.map((tab) => tab.snapshot.status));
@@ -552,14 +552,10 @@ const browserRuntimeReportRunner = new CoalescingRunner(async () => {
   void reportIncident('browser-runtime-report-failed', 'gam-default', { error: error instanceof Error ? error.message : String(error) });
 });
 
+const browserRuntimeReportTrigger = new ScheduledTrigger(() => browserRuntimeReportRunner.kick(), 'replace');
 function scheduleBrowserRuntimeReport(): void {
-  if (browserReportTimer !== undefined) clearTimeout(browserReportTimer);
-  browserReportTimer = setTimeout(() => {
-    browserReportTimer = undefined;
-    browserRuntimeReportRunner.kick();
-  }, RUNTIME_POLICY.browserRuntimeReportDebounceMs) as unknown as number;
+  browserRuntimeReportTrigger.schedule(RUNTIME_POLICY.browserRuntimeReportDebounceMs);
 }
-let fleetReconcileTimer: number | undefined;
 
 async function clearFleetBinding(conversationKey: string | undefined, tabId: number | undefined): Promise<void> {
   await bindingRegistry.clear(conversationKey, tabId);
@@ -679,15 +675,15 @@ async function reconcileAgentFleetOnce(): Promise<void> {
     void dispatchOrganizationTasks();
   });
 }
-let organizationRetryTimer: number | undefined;
-function retryOrganizationExecution(): void { if (organizationRetryTimer !== undefined) return; organizationRetryTimer = setTimeout(() => { organizationRetryTimer = undefined; scheduleFleetReconcile(0); }, RUNTIME_POLICY.organizationRetryMs) as unknown as number; }
+const organizationRetryTrigger = new ScheduledTrigger(() => scheduleFleetReconcile(0), 'keep');
+function retryOrganizationExecution(): void { organizationRetryTrigger.schedule(RUNTIME_POLICY.organizationRetryMs); }
 async function dispatchOrganizationTasks(): Promise<void> { const tasks = (await workState()).tasks; if (!hasOrganizationExecutionTask(tasks)) return; if (markOrganizationExecutionObserved(tasks)) void reportIncident('organization-auto-dispatch-observed', 'organization-runtime', {}); const results = await runReadyTasks(); if (results.some((result) => !result.ok)) retryOrganizationExecution(); }
 const fleetReconcileRunner = new CoalescingRunner(reconcileAgentFleetOnce, (error) => {
   void reportIncident('fleet-reconcile-failed', 'fleet-runtime', { error: error instanceof Error ? error.message : String(error) });
 });
+const fleetReconcileTrigger = new ScheduledTrigger(() => fleetReconcileRunner.kick(), 'replace');
 function scheduleFleetReconcile(delayMs: number = RUNTIME_POLICY.fleetReconcileDebounceMs): void {
-  if (fleetReconcileTimer !== undefined) clearTimeout(fleetReconcileTimer);
-  fleetReconcileTimer = setTimeout(() => { fleetReconcileTimer = undefined; fleetReconcileRunner.kick(); }, delayMs) as unknown as number;
+  fleetReconcileTrigger.schedule(delayMs);
 }
 async function closeOrphanBlankTabs(): Promise<void> { const tabs = await chrome.tabs.query({ url: 'about:blank' }); await Promise.all(tabs.flatMap((tab) => tab.id === undefined ? [] : [chrome.tabs.remove(tab.id).catch(() => undefined)])); }
 
