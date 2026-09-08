@@ -41,7 +41,7 @@ jobs:
       - name: Full release verification and packaging
         run: npm run release
       - name: Attest release archives
-        uses: actions/attest-build-provenance@bd77c077858b8d561b7a36cbe48ef4cc642ca39d
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: release/*.zip
       - name: Upload release evidence
