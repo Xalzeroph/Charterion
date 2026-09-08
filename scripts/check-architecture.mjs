@@ -101,15 +101,18 @@ if (!persistentNative.includes("from './nativeRpcProtocol.generated'")) {
 }
 
 const database = await readFile(resolve(root, 'control/src/database.ts'), 'utf8');
-const schemaVersion = Number(database.match(/CONTROL_SCHEMA_VERSION = (\d+)/)?.[1]);
-if (!Number.isInteger(schemaVersion) || schemaVersion < 1) throw new Error('Control schema version declaration is missing or invalid');
 for (const token of ['agent_conversations', 'worker_checkpoints', 'agent_rollovers', 'self_hosting_promotions', 'organization_runtime_acquisitions']) {
   if (!database.includes(token)) throw new Error(`Control schema fence missing: ${token}`);
 }
 const migrationVersions = [...database.matchAll(/private migrateV(\d+)\(\):/g)].map((match) => Number(match[1]));
+const schemaVersion = migrationVersions.at(-1) ?? 0;
+if (schemaVersion < 1) throw new Error('Control schema migration registry is empty');
 const expectedMigrations = Array.from({ length: schemaVersion }, (_, index) => index + 1);
 if (migrationVersions.length !== expectedMigrations.length || migrationVersions.some((version, index) => version !== expectedMigrations[index])) {
-  throw new Error('Control schema migration chain is not contiguous through the declared version');
+  throw new Error('Control schema migration chain is not contiguous');
+}
+if (!database.includes('export const CONTROL_SCHEMA_VERSION = controlMigrationVersions().at(-1) ?? 0;')) {
+  throw new Error('Control schema version must be derived from the migration registry');
 }
 
 const conversationAuthority = await readFile(resolve(root, 'control/src/conversationAuthority.ts'), 'utf8');

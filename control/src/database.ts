@@ -2,8 +2,6 @@ import { existsSync, mkdirSync } from 'node:fs';
 import { dirname, relative, resolve, isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-export const CONTROL_SCHEMA_VERSION = 27;
-
 export class ControlDatabase {
   readonly db: DatabaseSync;
 
@@ -72,42 +70,26 @@ export class ControlDatabase {
         value TEXT NOT NULL
       ) STRICT;
     `);
+    const migrations = controlMigrationVersions();
+    const supportedVersion = migrations.at(-1) ?? 0;
+    if (supportedVersion < 1) throw new Error('Control database has no registered migrations');
     const row = this.db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('schema_version') as { value?: string } | undefined;
     const version = row?.value ? Number(row.value) : 0;
-    if (version > CONTROL_SCHEMA_VERSION) {
-      throw new Error(`Control database schema ${version} is newer than supported ${CONTROL_SCHEMA_VERSION}`);
+    if (!Number.isInteger(version) || version < 0) throw new Error('Control database schema version is invalid');
+    if (version > supportedVersion) {
+      throw new Error(`Control database schema ${version} is newer than supported ${supportedVersion}`);
     }
-    if (version < 1) this.migrateV1();
-    if (version < 2) this.migrateV2();
-    if (version < 3) this.migrateV3();
-    if (version < 4) this.migrateV4();
-    if (version < 5) this.migrateV5();
-    if (version < 6) this.migrateV6();
-    if (version < 7) this.migrateV7();
-    if (version < 8) this.migrateV8();
-    if (version < 9) this.migrateV9();
-    if (version < 10) this.migrateV10();
-    if (version < 11) this.migrateV11();
-    if (version < 12) this.migrateV12();
-    if (version < 13) this.migrateV13();
-    if (version < 14) this.migrateV14();
-    if (version < 15) this.migrateV15();
-    if (version < 16) this.migrateV16();
-    if (version < 17) this.migrateV17();
-    if (version < 18) this.migrateV18();
-    if (version < 19) this.migrateV19();
-    if (version < 20) this.migrateV20();
-    if (version < 21) this.migrateV21();
-    if (version < 22) this.migrateV22();
-    if (version < 23) this.migrateV23();
-    if (version < 24) this.migrateV24();
-    if (version < 25) this.migrateV25();
-    if (version < 26) this.migrateV26();
-    if (version < 27) this.migrateV27();
+    for (const migrationVersion of migrations) {
+      if (version >= migrationVersion) continue;
+      const name = `migrateV${migrationVersion}`;
+      const migration = (this as unknown as Record<string, unknown>)[name];
+      if (typeof migration !== 'function') throw new Error(`Control database migration ${name} is missing`);
+      (migration as () => void).call(this);
+    }
     this.db.prepare(`
       INSERT INTO schema_meta(key, value) VALUES('schema_version', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(String(CONTROL_SCHEMA_VERSION));
+    `).run(String(supportedVersion));
   }
 
   private migrateV1(): void {
@@ -972,3 +954,17 @@ export class ControlDatabase {
     `);
   }
 }
+function controlMigrationVersions(): number[] {
+  const versions = Object.getOwnPropertyNames(ControlDatabase.prototype)
+    .flatMap((name) => {
+      const match = /^migrateV(\d+)$/.exec(name);
+      return match ? [Number(match[1])] : [];
+    })
+    .sort((left, right) => left - right);
+  for (let index = 0; index < versions.length; index += 1) {
+    if (versions[index] !== index + 1) throw new Error(`Control database migration chain has a gap before V${index + 1}`);
+  }
+  return versions;
+}
+
+export const CONTROL_SCHEMA_VERSION = controlMigrationVersions().at(-1) ?? 0;
