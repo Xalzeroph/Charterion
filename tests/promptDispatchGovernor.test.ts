@@ -170,6 +170,28 @@ describe('PromptDispatchGovernor', () => {
     expect(secondUntil - h.now()).toBe(DEFAULT_PROMPT_DISPATCH_POLICY.baseRateLimitBackoffMs * 2);
   });
 
+  it('does not retain phantom rate-limit backoff when persistence fails', async () => {
+    let persisted: PromptDispatchGovernorState | undefined;
+    let failNextWrite = true;
+    const store = {
+      read: async () => structuredClone(persisted),
+      write: async (next: PromptDispatchGovernorState) => {
+        if (failNextWrite) {
+          failNextWrite = false;
+          throw new Error('storage unavailable');
+        }
+        persisted = structuredClone(next);
+      },
+    };
+    const governor = new PromptDispatchGovernor(store, DEFAULT_PROMPT_DISPATCH_POLICY, () => 1_000_000, async () => undefined, () => 0);
+
+    await expect(governor.noteRateLimit()).rejects.toThrow('storage unavailable');
+    const permit = await governor.acquire({ activeGenerations: 0 });
+
+    expect(permit).toMatchObject({ allowed: true, reservedAt: 1_000_000 });
+    expect(persisted).toMatchObject({ backoffUntil: 0, rateLimitStrikes: 0, recentDispatches: [1_000_000] });
+  });
+
   it('resets strike severity after a long quiet period', async () => {
     const h = harness();
     await h.governor.noteRateLimit();
