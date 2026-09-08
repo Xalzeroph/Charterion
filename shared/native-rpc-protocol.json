@@ -24,6 +24,7 @@
     { "name": "resource.list", "domain": "resource" },
     { "name": "lease.list", "domain": "lease" },
     { "name": "events.list", "domain": "event" },
+    { "name": "org-work.project-execution", "domain": "organization" },
     { "name": "work.snapshot", "domain": "work" },
     { "name": "work.replace", "domain": "work" },
     { "name": "work.mutate", "domain": "work" },
