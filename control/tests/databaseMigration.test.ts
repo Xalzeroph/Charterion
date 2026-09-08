@@ -6,6 +6,14 @@ import { describe, expect, it } from 'vitest';
 import { CONTROL_SCHEMA_VERSION, ControlDatabase } from '../src/database';
 
 describe('control database migrations', () => {
+  it('derives the supported schema version from one contiguous migration registry', () => {
+    const versions = Object.getOwnPropertyNames(ControlDatabase.prototype)
+      .flatMap((name) => /^migrateV(\d+)$/.exec(name)?.[1] ?? [])
+      .map(Number)
+      .sort((left, right) => left - right);
+    expect(versions).toEqual(Array.from({ length: CONTROL_SCHEMA_VERSION }, (_, index) => index + 1));
+    expect(CONTROL_SCHEMA_VERSION).toBe(versions.at(-1));
+  });
   it('migrates v9 browser runtime rows to v10 page health semantics', () => {
     const dir = mkdtempSync(join(tmpdir(), 'gam-db-v9-'));
     const path = join(dir, 'global.db');
