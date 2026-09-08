@@ -35,7 +35,9 @@ describe('PromptDispatchGovernor', () => {
     const permit = await h.governor.acquire({ project: 'P', slotId: 'S1', activeGenerations: 0 });
     expect(permit).toMatchObject({ allowed: true, reservedAt: 1_000_000, waitedMs: 0 });
     expect(h.store.value()).toMatchObject({ recentDispatches: [1_000_000], projectLastDispatch: { p: 1_000_000 }, slotLastDispatch: { s1: 1_000_000 } });
-  });  it('serializes concurrent sends and spaces them by the global gap', async () => {
+  });
+
+  it('serializes concurrent sends and spaces them by the global gap', async () => {
     const h = harness();
     const [first, second] = await Promise.all([
       h.governor.acquire({ project: 'P1', slotId: 'S1', activeGenerations: 0 }),
@@ -44,6 +46,38 @@ describe('PromptDispatchGovernor', () => {
     expect(first).toMatchObject({ allowed: true, reservedAt: 1_000_000 });
     expect(second).toMatchObject({ allowed: true, reservedAt: 1_004_000, waitedMs: 4_000 });
     expect(h.store.value()?.recentDispatches).toEqual([1_000_000, 1_004_000]);
+  });
+
+  it('does not hold the global serialization lane while an acquire is sleeping', async () => {
+    let now = 1_000_000;
+    const store = memoryStore();
+    let releaseSleep!: () => void;
+    const sleeping = new Promise<void>((resolve) => { releaseSleep = resolve; });
+    let sleepEntered = false;
+    const governor = new PromptDispatchGovernor(
+      store,
+      DEFAULT_PROMPT_DISPATCH_POLICY,
+      () => now,
+      async (ms) => {
+        sleepEntered = true;
+        await sleeping;
+        now += ms;
+      },
+      () => 0,
+    );
+
+    const first = await governor.acquire({ project: 'P1', slotId: 'S1', activeGenerations: 0 });
+    expect(first.allowed).toBe(true);
+    const secondPending = governor.acquire({ project: 'P2', slotId: 'S2', activeGenerations: 0 });
+    for (let index = 0; index < 5 && !sleepEntered; index += 1) await Promise.resolve();
+    expect(sleepEntered).toBe(true);
+
+    const backoffUntil = await governor.noteRateLimit();
+    expect(backoffUntil).toBe(now + DEFAULT_PROMPT_DISPATCH_POLICY.baseRateLimitBackoffMs);
+
+    releaseSleep();
+    const second = await secondPending;
+    expect(second).toMatchObject({ allowed: false, reason: 'rate-limit-backoff' });
   });
 
   it('defers instead of blocking when the rolling budget needs a long wait', async () => {
@@ -89,7 +123,9 @@ describe('PromptDispatchGovernor', () => {
     const permit = await h.governor.acquire({ activeGenerations: DEFAULT_PROMPT_DISPATCH_POLICY.maxConcurrentGenerations });
     expect(permit).toEqual({ allowed: false, reason: 'generation-capacity', retryAfterMs: 5_000 });
     expect(h.store.value()).toBeUndefined();
-  });  it('keeps reservations across governor restarts', async () => {
+  });
+
+  it('keeps reservations across governor restarts', async () => {
     const h = harness();
     expect((await h.governor.acquire({ project: 'P', slotId: 'S', activeGenerations: 0 })).allowed).toBe(true);
     const restarted = new PromptDispatchGovernor(h.store, DEFAULT_PROMPT_DISPATCH_POLICY, h.now, async (ms) => h.advance(ms), () => 0);
