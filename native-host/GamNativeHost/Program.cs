@@ -5,7 +5,6 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
-const int MaxMessageBytes = 1024 * 1024;
 var allowedMethods = new HashSet<string>(StringComparer.Ordinal)
 {
     "health", "control.snapshot", "browser.report", "browser.status", "agent.browser-report", "agent.runtime-report", "agent.rollover-request", "agent.rollover-begin", "agent.rollover-bootstrap", "agent.rollover-complete", "agent.rollover-fail", "agent.rollover-status", "browser.operation-plan", "browser.operation-dispatch", "browser.operation-settle", "incident.report", "project.list", "agent.list", "resource.list", "lease.list", "events.list", "work.snapshot", "work.replace", "work.mutate", "work.batch-mutate", "fleet.reconcile", "workspace.provision", "workspace.list"
@@ -44,7 +43,7 @@ static bool TryReadFrame(Stream input, out byte[] payload)
     header[0] = (byte)first;
     ReadExactly(input, header[1..]);
     var length = BinaryPrimitives.ReadUInt32LittleEndian(header);
-    if (length == 0 || length > MaxMessageBytes) throw new InvalidDataException("Native message size is invalid.");
+    if (length == 0 || length > NativeProtocolLimits.MaxMessageBytes) throw new InvalidDataException("Native message size is invalid.");
     payload = new byte[length];
     ReadExactly(input, payload);
     return true;
@@ -63,7 +62,7 @@ static void ReadExactly(Stream stream, Span<byte> buffer)
 
 static void WriteFrame(Stream output, byte[] payload)
 {
-    if (payload.Length > MaxMessageBytes) throw new InvalidDataException("Native response is too large.");
+    if (payload.Length > NativeProtocolLimits.MaxMessageBytes) throw new InvalidDataException("Native response is too large.");
     Span<byte> header = stackalloc byte[4];
     BinaryPrimitives.WriteUInt32LittleEndian(header, (uint)payload.Length);
     output.Write(header);
@@ -113,6 +112,11 @@ static byte[] Error(string id, string code, string message)
     return Encoding.UTF8.GetBytes(value.ToJsonString());
 }
 
+static class NativeProtocolLimits
+{
+    public const int MaxMessageBytes = 1024 * 1024;
+}
+
 sealed class PipeForwarder : IDisposable
 {
     private readonly string pipeName;
@@ -138,7 +142,7 @@ sealed class PipeForwarder : IDisposable
                 writer!.WriteLine(Encoding.UTF8.GetString(request));
                 var response = reader!.ReadLine() ?? throw new IOException("gamd closed the pipe without a response.");
                 var payload = Encoding.UTF8.GetBytes(response);
-                if (payload.Length > MaxMessageBytes) throw new InvalidDataException("gamd response is too large.");
+                if (payload.Length > NativeProtocolLimits.MaxMessageBytes) throw new InvalidDataException("gamd response is too large.");
                 return payload;
             }
             catch (Exception error) when (error is IOException or TimeoutException or InvalidOperationException or ObjectDisposedException)
