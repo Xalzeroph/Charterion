@@ -3,8 +3,9 @@ import { resolve, relative } from 'node:path';
 
 const root = resolve(import.meta.dirname, '..');
 const srcRoot = resolve(root, 'src');
+const controlSrcRoot = resolve(root, 'control/src');
 
-async function sourceFiles(dir = srcRoot) {
+async function sourceFiles(dir) {
   const entries = await readdir(dir, { withFileTypes: true });
   const nested = await Promise.all(entries.map(async (entry) => {
     const path = resolve(dir, entry.name);
@@ -14,14 +15,21 @@ async function sourceFiles(dir = srcRoot) {
   return nested.flat();
 }
 
-const files = await sourceFiles();
+const files = await sourceFiles(srcRoot);
+const controlFiles = await sourceFiles(controlSrcRoot);
 const textByFile = new Map();
 for (const file of files) textByFile.set(file, await readFile(file, 'utf8'));
+const controlTextByFile = new Map();
+for (const file of controlFiles) controlTextByFile.set(file, await readFile(file, 'utf8'));
 
 function locations(token) {
   return [...textByFile.entries()]
     .filter(([, text]) => text.includes(token))
     .map(([file]) => relative(root, file).replaceAll('\\', '/'));
+}
+
+function relativeImports(text) {
+  return [...text.matchAll(/(?:from\s+|import\s*\()\s*['"](\.[^'"]+)['"]/g)].map((match) => match[1]);
 }
 
 const background = textByFile.get(resolve(srcRoot, 'background.ts')) ?? '';
@@ -39,6 +47,19 @@ const tabCreateOwners = locations('chrome.tabs.create(');
 const tabRemoveOwners = locations('chrome.tabs.remove(');
 if (tabCreateOwners.some((file) => file !== 'src/background.ts')) throw new Error(`chrome.tabs.create escaped fleet runtime: ${tabCreateOwners.join(', ')}`);
 if (tabRemoveOwners.some((file) => file !== 'src/background.ts')) throw new Error(`chrome.tabs.remove escaped fleet runtime: ${tabRemoveOwners.join(', ')}`);
+
+const nativeConnectOwners = locations('chrome.runtime.connectNative(');
+if (nativeConnectOwners.some((file) => file !== 'src/nativeMessageTransport.ts')) {
+  throw new Error(`connectNative escaped native transport layer: ${nativeConnectOwners.join(', ')}`);
+}
+const oneShotNativeOwners = locations('chrome.runtime.sendNativeMessage(');
+if (oneShotNativeOwners.some((file) => file !== 'src/nativeControlLegacy.ts')) {
+  throw new Error(`sendNativeMessage escaped quarantined legacy adapter: ${oneShotNativeOwners.join(', ')}`);
+}
+const legacyImportOwners = locations("from './nativeControlLegacy'");
+if (legacyImportOwners.some((file) => !['src/nativeControl.ts', 'src/nativeControlPersistent.ts'].includes(file))) {
+  throw new Error(`nativeControlLegacy escaped façade quarantine: ${legacyImportOwners.join(', ')}`);
+}
 
 const clickOwners = locations('.click();');
 if (clickOwners.some((file) => file !== 'src/chatgptAdapter.ts')) {
@@ -94,10 +115,33 @@ for (const helper of ['record', 'stringParam', 'numberParam', 'objectParam', 'ob
 for (const fence of ['Stale agent browser observation', 'Stale browser runtime observation']) {
   if (!controlPlane.includes(fence)) throw new Error(`Kernel observation fence missing: ${fence}`);
 }
-const nativeHost = await readFile(resolve(root, 'native-host/GamNativeHost/Program.cs'), 'utf8');
-for (const method of ['agent.rollover-request','agent.rollover-begin','agent.rollover-bootstrap','agent.rollover-complete','agent.rollover-fail','agent.rollover-status']) {
-  if (!nativeHost.includes(`"${method}"`)) throw new Error(`Native Host rollover allowlist is missing ${method}`);
+
+for (const [file, text] of controlTextByFile) {
+  const rel = relative(root, file).replaceAll('\\', '/');
+  if (!/Authority\.ts$/.test(rel)) continue;
+  for (const imported of relativeImports(text)) {
+    if (/\/(?:rpc|ipc|gam|gamd)(?:\.|$)/.test(imported) || /^\.\/(?:rpc|ipc|gam|gamd)$/.test(imported)) {
+      throw new Error(`Authority layer must not depend on transport/launcher layer: ${rel} -> ${imported}`);
+    }
+  }
 }
+
+const protocolManifest = JSON.parse(await readFile(resolve(root, 'shared/native-rpc-protocol.json'), 'utf8'));
+if (protocolManifest.schemaVersion !== 1 || !Array.isArray(protocolManifest.methods) || protocolManifest.methods.length === 0) {
+  throw new Error('Native RPC protocol manifest is missing or invalid');
+}
+const nativeHost = await readFile(resolve(root, 'native-host/GamNativeHost/Program.cs'), 'utf8');
+if (!nativeHost.includes('NativeRpcProtocol.AllowedMethods') || !nativeHost.includes('NativeRpcProtocol.MaxMessageBytes')) {
+  throw new Error('Native Host must consume the generated NativeRpcProtocol contract');
+}
+if (nativeHost.includes('new HashSet<string>') || protocolManifest.methods.some((method) => nativeHost.includes(`"${method.name}"`))) {
+  throw new Error('Native Host must not duplicate protocol method declarations');
+}
+const persistentNative = textByFile.get(resolve(srcRoot, 'nativeControlPersistent.ts')) ?? '';
+if (!persistentNative.includes("from './nativeRpcProtocol.generated'")) {
+  throw new Error('Persistent native adapter must consume the generated protocol contract');
+}
+
 const database = await readFile(resolve(root, 'control/src/database.ts'), 'utf8');
 const schemaVersion = database.match(/CONTROL_SCHEMA_VERSION = (\d+)/)?.[1];
 if (!schemaVersion || Number(schemaVersion) < 1) throw new Error('Control schema version declaration is missing or invalid');
@@ -117,4 +161,4 @@ for (const token of ['GAM CONVERSATION ROLLOVER HANDOFF', 'conversationLimitRetr
   if (!rolloverRuntime.includes(token)) throw new Error(`Conversation rollover runtime fence missing: ${token}`);
 }
 
-console.log(`Architecture hard-cut checks passed (${files.length} src files; background ${backgroundLines} lines).`);
+console.log(`Architecture hard-cut checks passed (${files.length} src files; ${controlFiles.length} control files; background ${backgroundLines} lines).`);
