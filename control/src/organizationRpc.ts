@@ -3,6 +3,8 @@ import type { ControlPlane } from './controlPlane';
 import type { AgentWorkspaceDangerousActionPolicy, AgentWorkspaceSecurityMode, AgentWorkspaceToolPolicyState, MissionMemberRole, MissionStatus, WorkItemCompletionPolicy, WorkItemStatus } from './organizationContracts';
 import type { WorkPriority, WorkRequesterKind, WorkRequestStatus } from './workIngressContracts';
 import type { RequestOrganizationRuntimeAcquisitionInput } from './organizationRuntimeAcquisitionAuthority';
+import type { AutonomousIntakeInput } from './autonomousIntakeAuthority';
+import type { ReviewDecision } from './reviewPoolContracts';
 
 type Params = Record<string, unknown>;
 export interface OrganizationRpcAuth {
@@ -48,6 +50,8 @@ const METHODS = new Set([
   'mission.create','mission.list','mission.assign-dri','mission.add-member','mission.status',
   'org-work.create','org-work.list','org-work.assign-owner','org-work.status','org-work.complete','org-work.outcome','org-work.project-execution',
   'work-request.submit','work-request.get','work-request.list','work-request.accept','work-request.reject','work-request.cancel',
+  'intake.submit',
+  'org-review.list','org-review.claim','org-review.decide',
 ]);
 
 export class OrganizationRpcController {
@@ -97,8 +101,66 @@ export class OrganizationRpcController {
       case 'work-request.accept': return this.requestAccept(request, params);
       case 'work-request.reject': return this.requestReject(request, params);
       case 'work-request.cancel': return this.requestCancel(request, params);
+      case 'intake.submit': return this.intakeSubmit(request, params);
+      case 'org-review.list': return this.reviewList(request, params);
+      case 'org-review.claim': return this.reviewClaim(request, params);
+      case 'org-review.decide': return this.reviewDecide(request, params);
       default: throw new Error(`Unknown organization RPC method ${request.method}`);
     }
+  }
+
+  private reviewAgent(request: RpcRequest, params: Params, scope: string): { agentId: string; projectId: string } {
+    const projectId = stringParam(params,'projectId')!;
+    const slotId = stringParam(params,'agentSlotId')!;
+    if (request.auth?.adminToken) {
+      this.auth.requireAdmin(request);
+      const agentId = stringParam(params,'reviewerAgentId')!;
+      return { agentId, projectId };
+    }
+    const grant = this.auth.requireCapability(request, scope, { projectId });
+    if (grant.subject !== slotId) throw new Error('Review capability subject does not match AgentSlot');
+    const row = this.plane.database.db.prepare('SELECT id FROM organization_agents WHERE runtime_slot_id=? AND status=\'active\'').get(slotId) as { id?: string } | undefined;
+    if (!row?.id) throw new Error('AgentSlot is not bound to an active Organization Agent');
+    return { agentId: row.id, projectId };
+  }
+
+  private reviewList(request: RpcRequest, params: Params): unknown {
+    const identity = this.reviewAgent(request, params, 'review:read');
+    return this.plane.reviewPool.queueForAgent(identity.agentId);
+  }
+
+  private reviewClaim(request: RpcRequest, params: Params): unknown {
+    const identity = this.reviewAgent(request, params, 'review:claim');
+    return this.plane.reviewPool.claim({ slotId: stringParam(params,'reviewSlotId')!, reviewerAgentId: identity.agentId });
+  }
+
+  private reviewDecide(request: RpcRequest, params: Params): unknown {
+    const identity = this.reviewAgent(request, params, 'review:decide');
+    const result = this.plane.reviewPool.decide({
+      slotId: stringParam(params,'reviewSlotId')!, reviewerAgentId: identity.agentId,
+      decision: enumParam<ReviewDecision>(params,'decision',['approve','request-changes','reject'] as const)!,
+      note: stringParam(params,'note')!,
+    });
+    const workflow = result.request.status === 'approved'
+      ? this.plane.organizationWorkflow.reconcileReviewDecision(result.request.id)
+      : undefined;
+    return { ...result, workflow };
+  }
+
+  private intakeSubmit(request: RpcRequest, params: Params): unknown {
+    this.auth.requireBrowserOrAdmin(request);
+    const input: AutonomousIntakeInput = {
+      objective: stringParam(params,'objective')!,
+      organizationId: stringParam(params,'organizationId',true), projectId: stringParam(params,'projectId',true),
+      projectName: stringParam(params,'projectName',true), rootPath: stringParam(params,'rootPath',true),
+      requesterKind: enumParam(params,'requesterKind',['human','external-ai','internal-agent','system'] as const,true),
+      requesterIdentity: stringParam(params,'requesterIdentity',true), contextRefs: stringArray(params,'contextRefs'),
+      constraints: stringArray(params,'constraints'), desiredOutputs: stringArray(params,'desiredOutputs'),
+      priority: enumParam(params,'priority',['low','normal','high','urgent'] as const,true),
+      completionPolicy: enumParam(params,'completionPolicy',['structured-result','verified-claim'] as const,true),
+      missionTitle: stringParam(params,'missionTitle',true), idempotencyKey: stringParam(params,'idempotencyKey',true),
+    };
+    return this.plane.autonomousIntake.submit(input);
   }
 
   private organizationCreate(request: RpcRequest, params: Params): unknown {
@@ -177,18 +239,45 @@ export class OrganizationRpcController {
   }
 
   private workCreate(request: RpcRequest, params: Params): unknown {
-    this.auth.requireAdmin(request);
+    const missionId = stringParam(params,'missionId')!;
+    const mission = this.plane.organization.getMission(missionId);
+    const parentWorkItemId = stringParam(params,'parentWorkItemId',true);
+    let defaultOwnerAgentId: string | undefined;
+    if (request.auth?.adminToken) this.auth.requireAdmin(request);
+    else {
+      if (!parentWorkItemId) throw new Error('Autonomous work creation requires parentWorkItemId');
+      const parent = this.plane.organization.getWorkItem(parentWorkItemId);
+      defaultOwnerAgentId = parent.ownerAgentId ?? undefined;
+      if (parent.missionId !== mission.id) throw new Error('Parent work item belongs to another Mission');
+      if (!mission.projectId) throw new Error('Autonomous work creation requires a project-bound Mission');
+      const grant = this.auth.requireCapability(request,'org-work:create',{ projectId: mission.projectId });
+      if (!grant.taskId || grant.taskId !== `org-work-${parent.id}`) throw new Error('Only the active parent Work capability may decompose its Mission');
+      const owner = this.plane.organization.getAgent(parent.ownerAgentId ?? '');
+      const slot = this.plane.getAgentSlot(grant.subject);
+      if (owner.runtimeSlotId !== slot.id || owner.organizationId !== mission.organizationId) throw new Error('Parent Work capability is not bound to the Mission owner');
+    }
     return this.plane.organization.createWorkItem({
-      missionId: stringParam(params,'missionId')!, title: stringParam(params,'title')!, objective: stringParam(params,'objective')!,
-      ownerAgentId: stringParam(params,'ownerAgentId',true),
+      missionId, title: stringParam(params,'title')!, objective: stringParam(params,'objective')!,
+      ownerAgentId: stringParam(params,'ownerAgentId',true) ?? defaultOwnerAgentId,
       completionPolicy: enumParam<WorkItemCompletionPolicy>(params,'completionPolicy',['structured-result','verified-claim'] as const, true),
       dependsOn: stringArray(params,'dependsOn'),
     });
   }
 
   private workStatus(request: RpcRequest, params: Params): unknown {
-    this.auth.requireAdmin(request);
-    return this.plane.organization.setWorkStatus(stringParam(params,'workItemId')!, enumParam<WorkItemStatus>(params,'status',['proposed','ready','active','blocked','completed','cancelled'] as const)!);
+    const workItemId = stringParam(params,'workItemId')!;
+    const status = enumParam<WorkItemStatus>(params,'status',['proposed','ready','active','blocked','completed','cancelled'] as const)!;
+    const work = this.plane.organization.getWorkItem(workItemId);
+    const mission = this.plane.organization.getMission(work.missionId);
+    const parentWorkItemId = stringParam(params,'parentWorkItemId',true);
+    if (request.auth?.adminToken) this.auth.requireAdmin(request);
+    else {
+      if (!parentWorkItemId || !mission.projectId) throw new Error('Autonomous work status requires parentWorkItemId and a project-bound Mission');
+      const parent = this.plane.organization.getWorkItem(parentWorkItemId);
+      const grant = this.auth.requireCapability(request,'org-work:status',{ projectId: mission.projectId });
+      if (parent.missionId !== mission.id || !grant.taskId || grant.taskId !== `org-work-${parent.id}`) throw new Error('Only the active parent Work capability may manage this Mission');
+    }
+    return this.plane.organization.setWorkStatus(workItemId, status);
   }
 
   private workComplete(request: RpcRequest, params: Params): unknown {
