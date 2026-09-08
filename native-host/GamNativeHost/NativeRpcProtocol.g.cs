@@ -30,6 +30,7 @@ internal static class NativeRpcProtocol
         "resource.list",
         "lease.list",
         "events.list",
+        "org-work.project-execution",
         "work.snapshot",
         "work.replace",
         "work.mutate",
