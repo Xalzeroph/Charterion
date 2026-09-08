@@ -1,9 +1,11 @@
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $Root 'native-host\scripts\NativeRpcProtocol.generated.ps1')
 $Id = [guid]::NewGuid().ToString('N')
 $SmokeRoot = Join-Path $Root ".build-cache\runtime-install-smoke\$Id"
 $GamTestHome = Join-Path $SmokeRoot 'home'
-$HostName = 'com.charterion.control'
+$HostName = $CharterionNativeHostName
+if ([string]::IsNullOrWhiteSpace($HostName)) { throw 'Generated Native Host name is missing.' }
 $RegistryPaths = @(
   "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName",
   "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$HostName"

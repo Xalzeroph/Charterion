@@ -1,7 +1,14 @@
 import { advanceAttempt } from './attempts';
 import { retainAttemptLedger } from './attemptLedger';
 import { normalizeTask } from './taskPolicy';
-import { mutateNativeWorkDocument, readNativeWorkSnapshot, replaceNativeWorkState, settleNativeBrowserOperation } from './nativeControl';
+import {
+  batchMutateNativeWorkDocuments,
+  mutateNativeWorkDocument,
+  readNativeWorkSnapshot,
+  replaceNativeWorkState,
+  settleNativeBrowserOperation,
+  type NativeWorkDocumentMutation,
+} from './nativeControl';
 import { reportIncident } from './browserRuntimeReporting';
 import { MutationLane } from './mutationLane';
 import type { AgentMessage, AgentTask, ChatSnapshot, SendAttemptRecord, SendAttemptState } from './contracts';
@@ -14,6 +21,50 @@ export interface WorkState {
 }
 
 const mutationLane = new MutationLane();
+const MAX_AUTOMATIC_BATCH_MUTATIONS = 8;
+
+type WorkCollection = AgentTask[] | SendAttemptRecord[] | AgentMessage[];
+type WorkKind = NativeWorkDocumentMutation['kind'];
+
+function itemId(kind: WorkKind, value: AgentTask | SendAttemptRecord | AgentMessage): string {
+  return kind === 'attempt'
+    ? (value as SendAttemptRecord).attemptId
+    : (value as AgentTask | AgentMessage).id;
+}
+
+function collectionMutations(
+  kind: WorkKind,
+  current: WorkCollection,
+  next: WorkCollection,
+): NativeWorkDocumentMutation[] | undefined {
+  if (next.length < current.length) return undefined;
+  const mutations: NativeWorkDocumentMutation[] = [];
+  for (let index = 0; index < current.length; index += 1) {
+    const before = current[index]!;
+    const after = next[index]!;
+    if (itemId(kind, before) !== itemId(kind, after)) return undefined;
+    if (before !== after) mutations.push({ kind, document: after as unknown as Record<string, unknown> });
+  }
+  for (let index = current.length; index < next.length; index += 1) {
+    mutations.push({ kind, document: next[index]! as unknown as Record<string, unknown> });
+  }
+  return mutations;
+}
+
+export function planWorkPatchMutations(
+  current: WorkState,
+  next: Pick<WorkState, 'attempts' | 'tasks' | 'messages'>,
+  limit = MAX_AUTOMATIC_BATCH_MUTATIONS,
+): NativeWorkDocumentMutation[] | undefined {
+  const tasks = collectionMutations('task', current.tasks, next.tasks);
+  if (!tasks) return undefined;
+  const attempts = collectionMutations('attempt', current.attempts, next.attempts);
+  if (!attempts) return undefined;
+  const messages = collectionMutations('message', current.messages, next.messages);
+  if (!messages) return undefined;
+  const mutations = [...tasks, ...attempts, ...messages];
+  return mutations.length <= Math.max(0, limit) ? mutations : undefined;
+}
 
 export async function readWorkState(): Promise<WorkState> {
   const state = await readNativeWorkSnapshot();
@@ -21,9 +72,20 @@ export async function readWorkState(): Promise<WorkState> {
 }
 
 export async function replaceWorkState(current: WorkState, patch: Partial<Pick<WorkState, 'attempts' | 'tasks' | 'messages'>>): Promise<WorkState> {
-  const next = await replaceNativeWorkState({ revision: current.revision, attempts: patch.attempts ?? current.attempts, tasks: patch.tasks ?? current.tasks, messages: patch.messages ?? current.messages });
+  const attempts = patch.attempts ?? current.attempts;
+  const tasks = patch.tasks ?? current.tasks;
+  const messages = patch.messages ?? current.messages;
+  const mutations = planWorkPatchMutations(current, { attempts, tasks, messages });
+  if (mutations && mutations.length > 0) {
+    const revision = await batchMutateNativeWorkDocuments({ expectedRevision: current.revision, mutations });
+    return { revision, attempts, tasks: tasks.map(normalizeTask), messages };
+  }
+  if (mutations?.length === 0) return current;
+
+  const next = await replaceNativeWorkState({ revision: current.revision, attempts, tasks, messages });
   return { revision: next.revision, attempts: next.attempts, tasks: next.tasks.map(normalizeTask), messages: next.messages };
 }
+
 export function serializeStateMutation<T>(operation: () => Promise<T>): Promise<T> {
   return mutationLane.run(operation);
 }
@@ -33,25 +95,40 @@ export async function workState(): Promise<WorkState> {
   return readWorkState();
 }
 
+async function persistAttemptDocument(
+  current: WorkState,
+  record: SendAttemptRecord,
+  alreadyPresent: boolean,
+): Promise<void> {
+  if (alreadyPresent) {
+    await mutateNativeWorkDocument({ kind: 'attempt', expectedRevision: current.revision, document: record as unknown as Record<string, unknown> });
+    return;
+  }
+
+  const merged = [...current.attempts, record];
+  const retained = retainAttemptLedger(merged, current.tasks, current.messages);
+  if (retained.length !== merged.length) {
+    await replaceWorkState(current, { attempts: retained });
+    return;
+  }
+  await mutateNativeWorkDocument({ kind: 'attempt', expectedRevision: current.revision, document: record as unknown as Record<string, unknown> });
+}
+
 export async function persistAttempt(record: SendAttemptRecord): Promise<void> {
   await serializeStateMutation(async () => {
     const current = await readWorkState();
-    const merged = [...current.attempts.filter((item) => item.attemptId !== record.attemptId), record];
-    const retained = retainAttemptLedger(merged, current.tasks, current.messages);
-    if (retained.length !== merged.length) await replaceWorkState(current, { attempts: retained });
-    else await mutateNativeWorkDocument({ kind: 'attempt', expectedRevision: current.revision, document: record as unknown as Record<string, unknown> });
+    const alreadyPresent = current.attempts.some((item) => item.attemptId === record.attemptId);
+    await persistAttemptDocument(current, record, alreadyPresent);
   });
 }
 
 export async function transitionAttempt(record: SendAttemptRecord, state: SendAttemptState, error?: string): Promise<SendAttemptRecord> {
   return serializeStateMutation(async () => {
     const currentState = await readWorkState();
-    const current = currentState.attempts.find((item) => item.attemptId === record.attemptId) ?? record;
+    const existing = currentState.attempts.find((item) => item.attemptId === record.attemptId);
+    const current = existing ?? record;
     const next = advanceAttempt(current, state, Date.now(), error);
-    const merged = [...currentState.attempts.filter((item) => item.attemptId !== next.attemptId), next];
-    const retained = retainAttemptLedger(merged, currentState.tasks, currentState.messages);
-    if (retained.length !== merged.length) await replaceWorkState(currentState, { attempts: retained });
-    else await mutateNativeWorkDocument({ kind: 'attempt', expectedRevision: currentState.revision, document: next as unknown as Record<string, unknown> });
+    await persistAttemptDocument(currentState, next, existing !== undefined);
     return next;
   });
 }
@@ -66,10 +143,7 @@ export async function markReplyObserved(attemptId: string, contentEpoch: string,
     if (advanced.state !== 'reply-observed') return false;
     const next: SendAttemptRecord = { ...advanced, replyObservedAt: Date.now(), replyTextTail: snapshot.latestAssistantText.slice(-8000) };
     if (snapshot.latestAssistantMessageId) next.replyMessageId = snapshot.latestAssistantMessageId;
-    const merged = [...state.attempts.filter((item) => item.attemptId !== next.attemptId), next];
-    const retained = retainAttemptLedger(merged, state.tasks, state.messages);
-    if (retained.length !== merged.length) await replaceWorkState(state, { attempts: retained });
-    else await mutateNativeWorkDocument({ kind: 'attempt', expectedRevision: state.revision, document: next as unknown as Record<string, unknown> });
+    await mutateNativeWorkDocument({ kind: 'attempt', expectedRevision: state.revision, document: next as unknown as Record<string, unknown> });
     return true;
   });
   if (persisted) {

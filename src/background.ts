@@ -1,29 +1,33 @@
 import { mapWithConcurrency } from './asyncPool';
-import { advanceAttempt } from './attempts';
 import { retainAttemptLedger } from './attemptLedger';
 import { deriveManagedTasks, isRetryableTaskAttempt, validateTaskGraph } from './taskGraph';
 import { markReplyObserved, persistAttempt, readWorkState, replaceWorkState, serializeStateMutation, transitionAttempt, workState, type WorkState } from './backgroundWorkState';
 import { dispatchReadyManagedTasks } from './taskDispatchRuntime';
 import { hasOrganizationExecutionTask, markOrganizationExecutionObserved } from './organizationWorkAutomation';
-import { attemptBelongsToTab } from './tabAttempt';
+import { projectManagedTabs } from './managedTabProjection';
 import { applyHumanDecision, applyTaskDisposition } from './taskLifecycle';
 import { applyReviewRemediation } from './reviewLoop';
 import { defaultCompletionPolicy, DEFAULT_MAX_REVIEW_ROUNDS, normalizeTask } from './taskPolicy';
 import { parseReviewResult } from './review';
 import { assertMessageDeliveryAvailable, buildSemanticMessagePrompt, createAgentMessage, planMessageDispatch } from './messageBus';
 import { createPortableManagerState, parsePortableManagerState, restorePortableAttempts, stringifyPortableManagerState } from './stateTransfer';
-import { recoverAttempt, type AttemptRecoveryObservation } from './recovery';
+import type { AttemptRecoveryObservation } from './recovery';
+import { applyRestartRecovery, restartRecoveryCandidates } from './restartRecoveryPolicy';
 import { beginNativeAgentRollover, dispatchNativeBrowserOperation, planNativeBrowserOperation, mutateNativeWorkDocument, readNativeControlSnapshot, readNativeWorkSnapshot, replaceNativeWorkState, reportNativeAgentBrowser, reportNativeBrowserRuntime, reconcileNativeElasticFleet, settleNativeBrowserOperation } from './nativeControl';
 import { planFleetReconciliation, workerRequestMessage } from './fleet';
 import { bootstrapPendingConversationRollover, bootstrapReplyAttemptId, completeConversationRolloverForReply, requestAutomaticConversationRollover } from './conversationRollover';
 import { deriveBrowserRuntimeObservation, fleetExpansionAllowed } from './browserRuntime';
 import { CoalescingRunner } from './coalescingRunner';
+import { ScheduledTrigger } from './scheduledTrigger';
 import { TabOperationQueue } from './tabOperationQueue';
-import { MutationLane } from './mutationLane';
+import { FleetTabRegistry } from './fleetTabRegistry';
+import { RUNTIME_STORAGE_KEYS } from './runtimeStorageKeys';
+import { RUNTIME_POLICY } from './runtimePolicy';
+import { ensureAutomationAlarms, isAutomationAlarm } from './runtimeAutomation';
 import { controlFeedbackMessages } from './controlFeedback';
 import { ContentRuntimeFence } from './contentRuntimeFence';
 import { browserOperationPolicy } from './browserOperationPolicy';
-import { createBindingStore } from './bindingStore';
+import { createBindingRegistry } from './bindingRegistry';
 import { recoveryStateForTab, snapshotForTab } from './contentRuntimeBridge';
 import { reportIncident, reportSlotRuntime, sha256Text } from './browserRuntimeReporting';
 import { PROMPT_DISPATCH_GOVERNOR_KEY, PromptDispatchGovernor } from './promptDispatchGovernor';
@@ -42,90 +46,57 @@ import {
   type SendResult,
   type TaskDispatchResult,
 } from './contracts';
-const BINDINGS_KEY = 'bindings.v1';
-const TAB_BINDINGS_KEY = 'tabBindings.v1';
-const SEND_ATTEMPTS_KEY = 'sendAttempts.v1';
-const TASKS_KEY = 'tasks.v1';
-const MESSAGES_KEY = 'messages.v1';
-const SUPERVISOR_KEY = 'supervisor.v1';
-const FLEET_TABS_KEY = 'fleetTabs.v1';
-const CONTROL_REQUEST_MESSAGE_PREFIX = 'control-request:';
-const MAX_PARALLEL_BROWSER_PROBES = 6;
-const MAX_PARALLEL_TAB_DISPATCHES = 4;
-const bindingMutationLane = new MutationLane();
-const fleetTabMapMutationLane = new MutationLane();
+const {
+  bindings: BINDINGS_KEY,
+  tabBindings: TAB_BINDINGS_KEY,
+  sendAttempts: SEND_ATTEMPTS_KEY,
+  tasks: TASKS_KEY,
+  messages: MESSAGES_KEY,
+  supervisor: SUPERVISOR_KEY,
+} = RUNTIME_STORAGE_KEYS;
+const {
+  controlRequestMessagePrefix: CONTROL_REQUEST_MESSAGE_PREFIX,
+  maxParallelBrowserProbes: MAX_PARALLEL_BROWSER_PROBES,
+  maxParallelTabDispatches: MAX_PARALLEL_TAB_DISPATCHES,
+} = RUNTIME_POLICY;
+
 const tabOperations = new TabOperationQueue();
 const contentRuntimeFence = new ContentRuntimeFence();
 const promptDispatchGovernor = new PromptDispatchGovernor({
   read: async () => (await chrome.storage.local.get(PROMPT_DISPATCH_GOVERNOR_KEY))[PROMPT_DISPATCH_GOVERNOR_KEY],
   write: async (state) => { await chrome.storage.local.set({ [PROMPT_DISPATCH_GOVERNOR_KEY]: state }); },
 });
-function serializeBindingMutation<T>(operation: () => Promise<T>): Promise<T> {
-  return bindingMutationLane.run(operation);
-}
-
-const bindingStore = createBindingStore(
+const bindingRegistry = createBindingRegistry(
   { local: chrome.storage.local, session: chrome.storage.session },
   { persistent: BINDINGS_KEY, ephemeral: TAB_BINDINGS_KEY },
 );
 
-async function fleetTabMap(): Promise<Record<string, number>> {
-  const stored = await chrome.storage.session.get(FLEET_TABS_KEY);
-  const value = stored[FLEET_TABS_KEY];
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  const result: Record<string, number> = {};
-  for (const [slotId, tabId] of Object.entries(value)) {
-    if (Number.isInteger(tabId) && Number(tabId) >= 0) result[slotId] = Number(tabId);
-  }
-  return result;
-}
 
-async function saveFleetTabMap(value: Record<string, number>): Promise<void> {
-  await chrome.storage.session.set({ [FLEET_TABS_KEY]: value });
-}
+const fleetTabs = new FleetTabRegistry(chrome.storage.session);
 
-function serializeFleetTabMapMutation<T>(operation: () => Promise<T>): Promise<T> {
-  return fleetTabMapMutationLane.run(operation);
-}
 async function reconcileAfterRestart(): Promise<void> {
-  const state = await workState();
-  const active = state.attempts.filter((attempt) =>
-    attempt.state === 'prepared' || attempt.state === 'dispatched' || attempt.state === 'acknowledged',
-  );
+  const active = restartRecoveryCandidates((await workState()).attempts);
   if (active.length === 0) return;
 
   const tabs = await chrome.tabs.query({ url: ['https://chatgpt.com/*'] });
   const observations = (await mapWithConcurrency(tabs, MAX_PARALLEL_BROWSER_PROBES, recoveryStateForTab)).filter(
     (value): value is AttemptRecoveryObservation => value !== undefined,
   );
-  const control = await readNativeControlSnapshot().catch(() => undefined); if (control) for (const observation of observations) { const key = control.agents.find((agent) => agent.browserTabId === observation.tabId)?.conversationKey; if (key) observation.authoritativeConversationKey = key; }
-  const byTab = new Map(observations.map((observation) => [observation.tabId, observation]));
+  const control = await readNativeControlSnapshot().catch(() => undefined);
+  if (control) for (const observation of observations) {
+    const key = control.agents.find((agent) => agent.browserTabId === observation.tabId)?.conversationKey;
+    if (key) observation.authoritativeConversationKey = key;
+  }
 
   await serializeStateMutation(async () => {
     const current = await readWorkState();
-    let attempts = current.attempts;
-    let changed = false;
-    for (const record of active) {
-      const latest = attempts.find((attempt) => attempt.attemptId === record.attemptId);
-      if (!latest || latest.state !== record.state) continue;
-      const decision = recoverAttempt(latest, byTab.get(latest.tabId));
-      if (!decision.nextState) continue;
-      const next = advanceAttempt(latest, decision.nextState, Date.now(), decision.error);
-      if (next.state === latest.state && next.error === latest.error) continue;
-      attempts = retainAttemptLedger([...attempts.filter((attempt) => attempt.attemptId !== next.attemptId), next], current.tasks, current.messages);
-      changed = true;
-    }
-    if (changed) await replaceWorkState(current, { attempts });
+    const attempts = applyRestartRecovery(current, active, observations);
+    if (attempts) await replaceWorkState(current, { attempts });
   });
 }
 
 async function bindingFor(tabId: number, snapshot: ChatSnapshot): Promise<RoleBinding> {
-  return serializeBindingMutation(async () => {
-    const stores = await bindingStore.read();
-    const binding = bindingStore.resolve(tabId, snapshot, stores);
-    await bindingStore.persist(stores);
-    return binding;
-  });
+  return bindingRegistry.resolve(tabId, snapshot);
 }
 
 async function managedTabs(attempts?: readonly SendAttemptRecord[]): Promise<ManagedTab[]> {
@@ -137,34 +108,16 @@ async function managedTabs(attempts?: readonly SendAttemptRecord[]): Promise<Man
   if (candidates.length === 0) return [];
   const ledger = attempts ?? currentState?.attempts ?? [];
   const observed = await mapWithConcurrency(candidates, MAX_PARALLEL_BROWSER_PROBES, async (tab) => ({
-    tab,
+    tabId: tab.id,
+    windowId: tab.windowId,
+    active: tab.active,
     snapshot: await snapshotForTab(tab),
   }));
-  return serializeBindingMutation(async () => {
-    const stores = await bindingStore.read();
-    const managed = observed
-      .sort((a, b) => a.tab.id - b.tab.id)
-      .map(({ tab, snapshot }) => {
-        const lastAttempt = [...ledger].reverse().find((attempt) =>
-          attemptBelongsToTab(attempt, tab.id, snapshot),
-        );
-        const result: ManagedTab = {
-          tabId: tab.id,
-          windowId: tab.windowId,
-          active: tab.active,
-          snapshot,
-          binding: bindingStore.resolve(tab.id, snapshot, stores),
-        };
-        if (lastAttempt) result.lastAttempt = lastAttempt;
-        return result;
-      });
-    await bindingStore.persist(stores);
-    return managed;
-  });
+  return bindingRegistry.project((resolveBinding) => projectManagedTabs(observed, ledger, resolveBinding));
 }
 
 async function updateBinding(tabId: number, conversationKey: string, binding: RoleBinding): Promise<void> {
-  await serializeBindingMutation(() => bindingStore.update(tabId, conversationKey, binding));
+  await bindingRegistry.update(tabId, conversationKey, binding);
 }
 
 async function prepareAttempt(
@@ -508,13 +461,13 @@ async function retryReviewLoop(taskId: string): Promise<{ reviewTask: AgentTask;
 }
 
 async function exportStateDocument(): Promise<string> {
-  const [bindings, state, enabled] = await Promise.all([bindingStore.readPersistent(), workState(), supervisorEnabled()]);
+  const [bindings, state, enabled] = await Promise.all([bindingRegistry.readPersistent(), workState(), supervisorEnabled()]);
   return stringifyPortableManagerState(createPortableManagerState(bindings, state.tasks, state.attempts, state.messages, enabled));
 }
 
 async function importStateDocument(document: string): Promise<void> {
   const imported = parsePortableManagerState(document);
-  await serializeBindingMutation(async () => {
+  await bindingRegistry.run(async () => {
     await serializeStateMutation(async () => {
       const current = await readWorkState();
       await replaceWorkState(current, {
@@ -555,7 +508,7 @@ async function runReadyTasks(): Promise<TaskDispatchResult[]> {
   validateTaskGraph(state.tasks);
   const tasks = deriveManagedTasks(state.tasks, state.attempts);
   const tabs = await managedTabs(state.attempts);
-  const [controlSnapshot, mapping] = await Promise.all([readNativeControlSnapshot(), fleetTabMap()]);
+  const [controlSnapshot, mapping] = await Promise.all([readNativeControlSnapshot(), fleetTabs.read()]);
   return dispatchReadyManagedTasks(tasks, tabs, controlSnapshot, mapping, crypto.randomUUID(), dispatchToTab);
 }
 
@@ -576,7 +529,6 @@ async function focusTab(tabId: number): Promise<void> {
   await chrome.windows.update(tab.windowId, { focused: true });
 }
 
-let browserReportTimer: number | undefined;
 
 async function reportBrowserRuntimeFromTabs(tabs: ManagedTab[]): Promise<void> {
   const runtime = deriveBrowserRuntimeObservation(tabs.map((tab) => tab.snapshot.status));
@@ -598,17 +550,13 @@ const browserRuntimeReportRunner = new CoalescingRunner(async () => {
   void reportIncident('browser-runtime-report-failed', 'gam-default', { error: error instanceof Error ? error.message : String(error) });
 });
 
+const browserRuntimeReportTrigger = new ScheduledTrigger(() => browserRuntimeReportRunner.kick(), 'replace');
 function scheduleBrowserRuntimeReport(): void {
-  if (browserReportTimer !== undefined) clearTimeout(browserReportTimer);
-  browserReportTimer = setTimeout(() => {
-    browserReportTimer = undefined;
-    browserRuntimeReportRunner.kick();
-  }, 250) as unknown as number;
+  browserRuntimeReportTrigger.schedule(RUNTIME_POLICY.browserRuntimeReportDebounceMs);
 }
-let fleetReconcileTimer: number | undefined;
 
 async function clearFleetBinding(conversationKey: string | undefined, tabId: number | undefined): Promise<void> {
-  await serializeBindingMutation(() => bindingStore.clear(conversationKey, tabId));
+  await bindingRegistry.clear(conversationKey, tabId);
 }
 
 async function syncWorkerRequestMessages(snapshot: import('./nativeControl').NativeControlSnapshot): Promise<void> {
@@ -661,12 +609,12 @@ async function deliverWorkerRequestMessages(snapshot: import('./nativeControl').
 }
 
 async function reconcileAgentFleetOnce(): Promise<void> {
-  return serializeFleetTabMapMutation(async () => {
+  return fleetTabs.run(async () => {
     await reconcileNativeElasticFleet();
     const snapshot = await readNativeControlSnapshot();
     const state = await workState();
     const currentTabs = await managedTabs(state.attempts);
-    const mapping = await fleetTabMap();
+    const mapping = await fleetTabs.read();
     const actions = planFleetReconciliation(snapshot.agents, currentTabs, mapping);
     const latestRuntime = [...snapshot.browserRuntime].sort((a, b) => b.observedAt - a.observedAt)[0];
     const currentRuntime = deriveBrowserRuntimeObservation(currentTabs.map((tab) => tab.snapshot.status));
@@ -680,38 +628,38 @@ async function reconcileAgentFleetOnce(): Promise<void> {
       if (action.kind === 'open') {
         if (!expansionAllowed) {
           if (agent.browserState !== 'absent') {
-            delete mapping[agent.id]; await saveFleetTabMap(mapping);
+            delete mapping[agent.id]; await fleetTabs.write(mapping);
             await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() });
           }
           continue;
         }
         const tab = await chrome.tabs.create({ url: action.url, active: false });
         if (tab.id === undefined) throw new Error(`Chrome did not return a tab id for agent slot ${agent.id}`);
-        mapping[agent.id] = tab.id; await saveFleetTabMap(mapping);
+        mapping[agent.id] = tab.id; await fleetTabs.write(mapping);
         const key = agent.conversationKey ?? `url:${action.url}`;
         await updateBinding(tab.id, key, { role: agent.role, project: project.name, notes: `GAM fleet slot ${agent.id}`, agentSlotId: agent.id });
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'opening', tabId: tab.id, observedAt: Date.now() });
       } else if (action.kind === 'rollover-start') {
         await beginNativeAgentRollover(agent.id, action.rolloverId); scheduleFleetReconcile(0);
       } else if (action.kind === 'rollover-close') {
-        await tabOperations.run(action.tabId, async () => { await beginNativeAgentRollover(agent.id, action.rolloverId); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'closing', tabId: action.tabId, observedAt: Date.now() }); await clearFleetBinding(agent.conversationKey, action.tabId); try { await chrome.tabs.remove(action.tabId); } catch (error) { await reportIncident('fleet-tab-close-failed', agent.id, { tabId: action.tabId, error: error instanceof Error ? error.message : String(error) }); } delete mapping[agent.id]; await saveFleetTabMap(mapping); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() }); });
+        await tabOperations.run(action.tabId, async () => { await beginNativeAgentRollover(agent.id, action.rolloverId); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'closing', tabId: action.tabId, observedAt: Date.now() }); await clearFleetBinding(agent.conversationKey, action.tabId); try { await chrome.tabs.remove(action.tabId); } catch (error) { await reportIncident('fleet-tab-close-failed', agent.id, { tabId: action.tabId, error: error instanceof Error ? error.message : String(error) }); } delete mapping[agent.id]; await fleetTabs.write(mapping); await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() }); });
       } else if (action.kind === 'close') {
         await tabOperations.run(action.tabId, async () => {
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'closing', tabId: action.tabId, observedAt: Date.now() });
         await clearFleetBinding(agent.conversationKey, action.tabId);
         try { await chrome.tabs.remove(action.tabId); } catch (error) { await reportIncident('fleet-tab-close-failed', agent.id, { tabId: action.tabId, error: error instanceof Error ? error.message : String(error) }); }
-        delete mapping[agent.id]; await saveFleetTabMap(mapping);
+        delete mapping[agent.id]; await fleetTabs.write(mapping);
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() });
         });
       } else if (action.kind === 'report-open') {
-        mapping[agent.id] = action.tabId; await saveFleetTabMap(mapping);
+        mapping[agent.id] = action.tabId; await fleetTabs.write(mapping);
         const tab = currentTabs.find((item) => item.tabId === action.tabId);
         if (tab && (tab.binding.agentSlotId !== agent.id || tab.binding.role !== agent.role || tab.binding.project !== project.name)) {
           await updateBinding(tab.tabId, action.conversationKey ?? tab.snapshot.conversationKey, { role: agent.role, project: project.name, notes: `GAM fleet slot ${agent.id}`, agentSlotId: agent.id });
         }
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'open', tabId: action.tabId, ...(action.conversationKey ? { conversationKey: action.conversationKey } : {}), observedAt: Date.now() });
       } else {
-        delete mapping[agent.id]; await saveFleetTabMap(mapping);
+        delete mapping[agent.id]; await fleetTabs.write(mapping);
         await reportNativeAgentBrowser({ slotId: agent.id, profileId: 'gam-default', browserState: 'absent', observedAt: Date.now() });
       }
       } catch (error) {
@@ -725,15 +673,15 @@ async function reconcileAgentFleetOnce(): Promise<void> {
     void dispatchOrganizationTasks();
   });
 }
-let organizationRetryTimer: number | undefined;
-function retryOrganizationExecution(): void { if (organizationRetryTimer !== undefined) return; organizationRetryTimer = setTimeout(() => { organizationRetryTimer = undefined; scheduleFleetReconcile(0); }, 1000) as unknown as number; }
+const organizationRetryTrigger = new ScheduledTrigger(() => scheduleFleetReconcile(0), 'keep');
+function retryOrganizationExecution(): void { organizationRetryTrigger.schedule(RUNTIME_POLICY.organizationRetryMs); }
 async function dispatchOrganizationTasks(): Promise<void> { const tasks = (await workState()).tasks; if (!hasOrganizationExecutionTask(tasks)) return; if (markOrganizationExecutionObserved(tasks)) void reportIncident('organization-auto-dispatch-observed', 'organization-runtime', {}); const results = await runReadyTasks(); if (results.some((result) => !result.ok)) retryOrganizationExecution(); }
 const fleetReconcileRunner = new CoalescingRunner(reconcileAgentFleetOnce, (error) => {
   void reportIncident('fleet-reconcile-failed', 'fleet-runtime', { error: error instanceof Error ? error.message : String(error) });
 });
-function scheduleFleetReconcile(delayMs = 150): void {
-  if (fleetReconcileTimer !== undefined) clearTimeout(fleetReconcileTimer);
-  fleetReconcileTimer = setTimeout(() => { fleetReconcileTimer = undefined; fleetReconcileRunner.kick(); }, delayMs) as unknown as number;
+const fleetReconcileTrigger = new ScheduledTrigger(() => fleetReconcileRunner.kick(), 'replace');
+function scheduleFleetReconcile(delayMs: number = RUNTIME_POLICY.fleetReconcileDebounceMs): void {
+  fleetReconcileTrigger.schedule(delayMs);
 }
 async function closeOrphanBlankTabs(): Promise<void> { const tabs = await chrome.tabs.query({ url: 'about:blank' }); await Promise.all(tabs.flatMap((tab) => tab.id === undefined ? [] : [chrome.tabs.remove(tab.id).catch(() => undefined)])); }
 
@@ -903,22 +851,16 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   contentRuntimeFence.remove(tabId);
-  void serializeFleetTabMapMutation(async () => {
-    const [mapping, bindingChanged] = await Promise.all([
-      fleetTabMap(),
-      serializeBindingMutation(async () => {
-        const bindings = await bindingStore.readEphemeral();
-        if (bindings[String(tabId)] === undefined) return false;
-        delete bindings[String(tabId)];
-        await bindingStore.writeEphemeral(bindings);
-        return true;
-      }),
+  void fleetTabs.run(async () => {
+    const [mapping] = await Promise.all([
+      fleetTabs.read(),
+      bindingRegistry.clear(undefined, tabId),
     ]);
     let mappingChanged = false;
     for (const [slotId, mappedTabId] of Object.entries(mapping)) {
       if (mappedTabId === tabId) { delete mapping[slotId]; mappingChanged = true; }
     }
-    if (mappingChanged) await saveFleetTabMap(mapping);
+    if (mappingChanged) await fleetTabs.write(mapping);
     await notifyManagerChanged();
     scheduleFleetReconcile(0);
   }).catch((error) => reportIncident('tab-removal-reconciliation-failed', String(tabId), { error: error instanceof Error ? error.message : String(error) }));
@@ -931,19 +873,15 @@ void migrateLegacyWorkStateOnce().then(() => reconcileAfterRestart()).then(() =>
 }).catch((error) => {
   void reportIncident('restart-reconciliation-failed', 'service-worker', { error: error instanceof Error ? error.message : String(error) }, 'critical');
 });
-const FLEET_RECONCILE_ALARM = 'gam:fleet-reconcile'; const ORGANIZATION_DISPATCH_ALARM = 'gam:organization-dispatch';
-async function ensureAutomationAlarms(): Promise<void> {
-  const alarms = await Promise.all([chrome.alarms.get(FLEET_RECONCILE_ALARM), chrome.alarms.get(ORGANIZATION_DISPATCH_ALARM)]);
-  if (!alarms[0]) await chrome.alarms.create(FLEET_RECONCILE_ALARM, { periodInMinutes: 1 }); if (!alarms[1]) await chrome.alarms.create(ORGANIZATION_DISPATCH_ALARM, { periodInMinutes: 1 });
-}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name !== FLEET_RECONCILE_ALARM && alarm.name !== ORGANIZATION_DISPATCH_ALARM) return;
+  if (!isAutomationAlarm(alarm.name)) return;
   scheduleBrowserRuntimeReport();
   scheduleFleetReconcile(0);
   void dispatchOrganizationTasks().catch((error) => reportIncident('organization-auto-dispatch-failed', 'organization-runtime', { error: error instanceof Error ? error.message : String(error) }));
 });
-chrome.runtime.onInstalled.addListener(() => { void ensureAutomationAlarms().catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
-chrome.runtime.onStartup.addListener(() => { void ensureAutomationAlarms().catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
+chrome.runtime.onInstalled.addListener(() => { void ensureAutomationAlarms(chrome.alarms).catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
+chrome.runtime.onStartup.addListener(() => { void ensureAutomationAlarms(chrome.alarms).catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); scheduleBrowserRuntimeReport(); scheduleFleetReconcile(0); });
 void reportBrowserRuntimeFromTabs([]).catch((error) => reportIncident('browser-runtime-report-failed', 'startup', { error: error instanceof Error ? error.message : String(error) }));
 scheduleBrowserRuntimeReport();
-void ensureAutomationAlarms().catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); void closeOrphanBlankTabs().catch((error) => reportIncident('orphan-blank-tab-cleanup-failed', 'extension', { error: String(error) })); void dispatchOrganizationTasks().catch((error) => reportIncident('organization-auto-dispatch-failed', 'organization-runtime', { error: error instanceof Error ? error.message : String(error) }));
+void ensureAutomationAlarms(chrome.alarms).catch((error) => reportIncident('automation-alarm-configuration-failed', 'extension', { error: String(error) })); void closeOrphanBlankTabs().catch((error) => reportIncident('orphan-blank-tab-cleanup-failed', 'extension', { error: String(error) })); void dispatchOrganizationTasks().catch((error) => reportIncident('organization-auto-dispatch-failed', 'organization-runtime', { error: error instanceof Error ? error.message : String(error) }));
