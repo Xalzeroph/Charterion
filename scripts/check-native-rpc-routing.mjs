@@ -19,8 +19,10 @@ const declared = new Set(manifest.methods.map((method) => method.name));
 const routed = new Set(['health']);
 for (const source of [rpc, rpcLegacy, organizationRpc]) {
   for (const match of source.matchAll(/case\s+['"]([^'"]+)['"]\s*:/g)) routed.add(match[1]);
-  for (const match of source.matchAll(/request\.method\s*!==\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
-  for (const match of source.matchAll(/request\.method\s*===\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
+  for (const match of source.matchAll(/request(?:\?\.)?\.method\s*!==\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
+  for (const match of source.matchAll(/request(?:\?\.)?\.method\s*===\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
+  for (const match of source.matchAll(/request\?\.method\s*!==\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
+  for (const match of source.matchAll(/request\?\.method\s*===\s*['"]([^'"]+)['"]/g)) routed.add(match[1]);
 }
 
 const unrouted = [...declared].filter((method) => !routed.has(method));
