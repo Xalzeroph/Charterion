@@ -1,5 +1,6 @@
 import type { AgentMessage, ManagedTab } from './contracts';
 import type { ControlAgentView, ControlWorkerRequestView } from './nativeControl';
+import { RUNTIME_POLICY } from './runtimePolicy';
 
 export type FleetAction =
   | { kind: 'open'; slotId: string; url: string }
@@ -130,7 +131,7 @@ export function workerRequestMessage(
     '', 'Inspect the relevant project state, then accept or reject this request through the GAM Kernel.',
   ].join('\n');
   const message: AgentMessage = {
-    id: `control-request:${request.id}`,
+    id: `${RUNTIME_POLICY.controlRequestMessagePrefix}${request.id}`,
     project: projectName,
     fromRole,
     target: { kind: 'role', role: supervisorRole },

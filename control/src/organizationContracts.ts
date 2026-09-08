@@ -88,6 +88,23 @@ export interface WorkItemRecord {
   updatedAt: number;
 }
 
+export type OrganizationReviewWorkStatus = 'materialized' | 'claimed' | 'decided' | 'completed' | 'blocked';
+
+export interface OrganizationReviewWorkBinding {
+  id: string;
+  organizationId: string;
+  projectId: string;
+  missionId: string;
+  reviewRequestId: string;
+  reviewSlotId: string;
+  workItemId: string;
+  reviewerAgentId: string;
+  runtimeAcquisitionId: string;
+  status: OrganizationReviewWorkStatus;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface CreateOrganizationInput {
   name: string;
   purpose?: string | undefined;

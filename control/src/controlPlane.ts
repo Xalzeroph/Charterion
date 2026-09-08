@@ -16,6 +16,8 @@ import { FindingAuthority } from './findingAuthority';
 import { ReviewPoolAuthority } from './reviewPoolAuthority';
 import { OrganizationExecutionBridge } from './organizationExecutionBridge';
 import { OrganizationRuntimeAcquisitionAuthority } from './organizationRuntimeAcquisitionAuthority';
+import { AutonomousIntakeAuthority } from './autonomousIntakeAuthority';
+import { OrganizationWorkflowCoordinator } from './organizationWorkflowCoordinator';
 import { parseJsonRecord, parseJsonStringArray } from './persistenceCodec';
 import { planElasticFleet, type ElasticFleetDecision } from './elasticFleet';
 import { projectRootIdentity } from './projectIdentity';
@@ -182,6 +184,8 @@ export class ControlPlane {
   readonly reviewPool: ReviewPoolAuthority;
   readonly organizationExecution: OrganizationExecutionBridge;
   readonly organizationRuntime: OrganizationRuntimeAcquisitionAuthority;
+  readonly autonomousIntake: AutonomousIntakeAuthority;
+  readonly organizationWorkflow: OrganizationWorkflowCoordinator;
   constructor(readonly database: ControlDatabase, gitPath = 'git') {
     this.evidence = new EvidenceAuthority(database, gitPath);
     this.changes = new ChangeRequestAuthority(database, gitPath);
@@ -198,6 +202,8 @@ export class ControlPlane {
     this.reviewPool = new ReviewPoolAuthority(database);
     this.organizationExecution = new OrganizationExecutionBridge(database, this.organization, this.work);
     this.organizationRuntime = new OrganizationRuntimeAcquisitionAuthority(database, this.organization, (projectId, role, now) => this.createAgentSlot(projectId, role, now));
+    this.autonomousIntake = new AutonomousIntakeAuthority(this);
+    this.organizationWorkflow = new OrganizationWorkflowCoordinator(database, this.changes, this.reviewPool, this.organization, this.organizationRuntime, this.organizationExecution, this.promotions, gitPath);
   }
 
   provisionTaskWorkspace(projectId: string, slotId: string, taskId: string, now = Date.now()) {
@@ -226,7 +232,7 @@ export class ControlPlane {
         if (active.holderId !== slot.id || active.taskId !== taskId || active.mode !== 'exclusive') throw new Error('Task workspace resource already has an incompatible active lease');
         lease = active;
       } else lease = this.acquireLease({ resourceId: resource.id, projectId: project.id, holderId: slot.id, taskId, mode: 'exclusive' }, now);
-      capability = this.issueCapability({ subject: slot.id, projectId: project.id, agentSlotId: slot.id, taskId, leaseEpoch: lease.epoch, scopes: ['claim:submit','artifact:register','claim:read','claim:verify'], resourceIds: [resource.id], ttlMs: 7 * 24 * 60 * 60 * 1000 }, now);
+      capability = this.issueCapability({ subject: slot.id, projectId: project.id, agentSlotId: slot.id, taskId, leaseEpoch: lease.epoch, scopes: ['claim:submit','artifact:register','claim:read','claim:verify','org-work:create','org-work:status','review:read','review:claim','review:decide'], resourceIds: [resource.id], ttlMs: 7 * 24 * 60 * 60 * 1000 }, now);
       workspace = this.workspaces.record({ ...materialized, projectId: project.id, taskId, slotId: slot.id, resourceId: resource.id, leaseId: lease.id, leaseEpoch: lease.epoch, capabilityId: capability.id, capabilityToken: capability.token }, now);
       this.event(project.id, 'TASK_WORKSPACE_PROVISIONED', workspace.id, { taskId, slotId: slot.id, branch: workspace.branch, path: workspace.path, resourceId: resource.id, leaseId: lease.id }, now);
       return workspace!;
@@ -270,6 +276,26 @@ export class ControlPlane {
     }
   }
 
+  reconcilePersistedOrganizationWorkflows(now = Date.now()): number {
+    const rows = this.database.db.prepare(`
+      SELECT c.id AS claim_id, v.id AS verification_id
+      FROM claims c JOIN verifications v ON v.claim_id=c.id
+      WHERE c.status='verified' AND c.task_id LIKE 'org-work-%' AND v.status='passed'
+        AND v.id=(SELECT latest.id FROM verifications latest WHERE latest.claim_id=c.id ORDER BY latest.completed_at DESC LIMIT 1)
+      ORDER BY c.updated_at,c.id
+    `).all() as Array<{ claim_id: string; verification_id: string }>;
+    let reconciled = 0;
+    for (const row of rows) {
+      const claim = this.evidence.getClaim(row.claim_id);
+      const verification = this.evidence.getVerification(row.verification_id);
+      const workspace = this.workspaces.find(claim.projectId, claim.taskId);
+      if (!workspace) continue;
+      this.organizationWorkflow.reconcileVerifiedWork(claim, verification, workspace, now);
+      reconciled += 1;
+    }
+    return reconciled;
+  }
+
   verifyClaimAndCompleteTask(claimId: string, now = Date.now()) {
     const claim = this.evidence.getClaim(claimId);
     const verification = this.evidence.verifyClaim(claimId, now);
@@ -289,6 +315,9 @@ export class ControlPlane {
         throw new Error('Verified claim does not match the task workspace authority');
       }
       this.work.completeVerifiedClaim({ taskId: claim.taskId, claimId: claim.id, verificationId: verification.id, commitSha: claim.commitSha }, verification.completedAt);
+      if (claim.taskId.startsWith('org-work-')) {
+        this.organizationWorkflow.reconcileVerifiedWork(claim, verification, workspace, now);
+      }
       this.finalizeVerifiedTaskWorkspace(workspace.id, now);
     }
     return verification;

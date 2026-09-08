@@ -8,6 +8,13 @@ import type { NativeControlSnapshot } from './nativeControl';
 
 export const MAX_PARALLEL_TASK_DISPATCHES = 4;
 
+const inFlightTaskRevisions = new Set<string>();
+
+function taskRevisionKey(managed: ManagedTask): string {
+  const task = managed.task;
+  return [task.project, task.id, task.updatedAt, task.attemptIds.length, task.retryAfterAttemptId ?? ''].join('\u0000');
+}
+
 export async function dispatchReadyManagedTasks(
   tasks: readonly ManagedTask[],
   tabs: readonly ManagedTab[],
@@ -25,6 +32,11 @@ export async function dispatchReadyManagedTasks(
     }
     const managed = byTaskId.get(decision.taskId);
     if (!managed) return { taskId: decision.taskId, ok: false, error: 'Task disappeared after dispatch planning' };
+    const revisionKey = taskRevisionKey(managed);
+    if (inFlightTaskRevisions.has(revisionKey)) {
+      return { taskId: managed.task.id, ok: false, error: 'Task dispatch is already in flight for this task revision' };
+    }
+    inFlightTaskRevisions.add(revisionKey);
     try {
       const dependencies = managed.task.dependsOn.map((id) => byTaskId.get(id))
         .filter((item): item is ManagedTask => item !== undefined);
@@ -40,6 +52,8 @@ export async function dispatchReadyManagedTasks(
       return result;
     } catch (error) {
       return { taskId: managed.task.id, ok: false, error: error instanceof Error ? error.message : String(error) };
+    } finally {
+      inFlightTaskRevisions.delete(revisionKey);
     }
   });
 }

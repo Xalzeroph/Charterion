@@ -3,18 +3,14 @@ export class TabOperationQueue {
 
   run<T>(tabId: number, operation: () => Promise<T>): Promise<T> {
     const previous = this.tails.get(tabId) ?? Promise.resolve();
-    let release!: () => void;
-    const gate = new Promise<void>((resolve) => { release = resolve; });
-    const marker = previous.catch(() => undefined).then(() => gate);
-    this.tails.set(tabId, marker);
+    const run = previous.then(operation, operation);
+    const settled = run.then(() => undefined, () => undefined);
+    this.tails.set(tabId, settled);
 
-    return previous
-      .catch(() => undefined)
-      .then(operation)
-      .finally(() => {
-        release();
-        if (this.tails.get(tabId) === marker) this.tails.delete(tabId);
-      });
+    void settled.finally(() => {
+      if (this.tails.get(tabId) === settled) this.tails.delete(tabId);
+    });
+    return run;
   }
 
   pending(tabId: number): boolean {

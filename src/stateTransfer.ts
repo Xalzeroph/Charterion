@@ -58,6 +58,8 @@ function taskValue(value: unknown, index: number): AgentTask {
   return normalizeTask(item as unknown as AgentTask);
 }
 
+const ATTEMPT_STATES = new Set(['prepared', 'dispatched', 'acknowledged', 'reply-observed', 'failed', 'uncertain']);
+
 function attemptValue(value: unknown, index: number): PortableSendAttemptRecord {
   const item = record(value);
   if (item.contentEpoch !== undefined) throw new Error(`attempts[${index}].contentEpoch is runtime-local and not portable`);
@@ -67,8 +69,7 @@ function attemptValue(value: unknown, index: number): PortableSendAttemptRecord 
   for (const key of ['tabId', 'textLength', 'baselineAssistantMessageCount', 'createdAt', 'updatedAt'] as const) {
     numberValue(item[key], `attempts[${index}].${key}`);
   }
-  const states = new Set(['prepared', 'dispatched', 'acknowledged', 'reply-observed', 'failed', 'uncertain']);
-  if (!states.has(item.state as string)) throw new Error(`attempts[${index}].state is invalid`);
+  if (!ATTEMPT_STATES.has(item.state as string)) throw new Error(`attempts[${index}].state is invalid`);
   if (item.retryOfAttemptId !== undefined) stringValue(item.retryOfAttemptId, `attempts[${index}].retryOfAttemptId`, 2000);
   return item as unknown as PortableSendAttemptRecord;
 }
@@ -155,11 +156,12 @@ export function parsePortableManagerState(document: string): PortableManagerStat
   validateTaskGraph(tasks);
 
   const attemptIds = new Set<string>();
+  const attemptsById = new Map<string, PortableSendAttemptRecord>();
   for (const attempt of attempts) {
     if (attemptIds.has(attempt.attemptId)) throw new Error(`Duplicate attempt id ${attempt.attemptId}`);
     attemptIds.add(attempt.attemptId);
+    attemptsById.set(attempt.attemptId, attempt);
   }
-  const attemptsById = new Map(attempts.map((attempt) => [attempt.attemptId, attempt]));
   for (const attempt of attempts) {
     if (!attempt.retryOfAttemptId) continue;
     const source = attemptsById.get(attempt.retryOfAttemptId);
@@ -170,7 +172,9 @@ export function parsePortableManagerState(document: string): PortableManagerStat
     }
     if (source.createdAt > attempt.createdAt) throw new Error(`Attempt ${attempt.attemptId} retry lineage points forward in time`);
   }
-  const taskIds = new Set(tasks.map((task) => task.id));
+
+  const tasksById = new Map<string, AgentTask>();
+  for (const task of tasks) tasksById.set(task.id, task);
   for (const task of tasks) {
     for (const attemptId of task.attemptIds) {
       const attempt = attemptsById.get(attemptId);
@@ -180,32 +184,36 @@ export function parsePortableManagerState(document: string): PortableManagerStat
       }
     }
   }
-  const messageIds = new Set<string>();
+
+  const messagesById = new Map<string, AgentMessage>();
+  const recipientSets = new Map<string, Set<string>>();
   for (const message of messages) {
-    if (messageIds.has(message.id)) throw new Error(`Duplicate message id ${message.id}`);
-    messageIds.add(message.id);
-    if (message.taskId && !taskIds.has(message.taskId)) throw new Error(`Message ${message.id} references missing task ${message.taskId}`);
+    if (messagesById.has(message.id)) throw new Error(`Duplicate message id ${message.id}`);
+    messagesById.set(message.id, message);
+    if (message.recipientConversationKeys) recipientSets.set(message.id, new Set(message.recipientConversationKeys));
+    if (message.taskId && !tasksById.has(message.taskId)) throw new Error(`Message ${message.id} references missing task ${message.taskId}`);
     for (const attemptId of message.attemptIds) {
       const attempt = attemptsById.get(attemptId);
       if (!attempt) throw new Error(`Message ${message.id} references missing attempt ${attemptId}`);
       if (attempt.messageId !== message.id || attempt.taskId) {
         throw new Error(`Message ${message.id} references attempt ${attemptId} with inconsistent ownership`);
       }
-      if (message.recipientConversationKeys && !message.recipientConversationKeys.includes(attempt.conversationKey)) {
+      if (message.recipientConversationKeys && !recipientSets.get(message.id)!.has(attempt.conversationKey)) {
         throw new Error(`Message ${message.id} attempt ${attemptId} is outside its frozen recipient set`);
       }
     }
   }
+
   for (const attempt of attempts) {
     if (attempt.taskId && attempt.messageId) throw new Error(`Attempt ${attempt.attemptId} cannot belong to both a task and a message`);
     if (attempt.taskId) {
-      if (!taskIds.has(attempt.taskId)) throw new Error(`Attempt ${attempt.attemptId} references missing task ${attempt.taskId}`);
-      const owner = tasks.find((task) => task.id === attempt.taskId)!;
+      const owner = tasksById.get(attempt.taskId);
+      if (!owner) throw new Error(`Attempt ${attempt.attemptId} references missing task ${attempt.taskId}`);
       if (!owner.attemptIds.includes(attempt.attemptId)) throw new Error(`Attempt ${attempt.attemptId} is not referenced by owning task ${attempt.taskId}`);
     }
     if (attempt.messageId) {
-      if (!messageIds.has(attempt.messageId)) throw new Error(`Attempt ${attempt.attemptId} references missing message ${attempt.messageId}`);
-      const owner = messages.find((message) => message.id === attempt.messageId)!;
+      const owner = messagesById.get(attempt.messageId);
+      if (!owner) throw new Error(`Attempt ${attempt.attemptId} references missing message ${attempt.messageId}`);
       if (!owner.attemptIds.includes(attempt.attemptId)) throw new Error(`Attempt ${attempt.attemptId} is not referenced by owning message ${attempt.messageId}`);
     }
   }

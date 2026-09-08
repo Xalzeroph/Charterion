@@ -17,6 +17,15 @@ export interface AttemptRecoveryDecision {
 }
 
 const SEND_STALE_MS = 2 * 60 * 1000;
+const deliveredAttemptSets = new WeakMap<ContentRecoveryState, ReadonlySet<string>>();
+
+function deliveredAttemptSet(state: ContentRecoveryState): ReadonlySet<string> {
+  const cached = deliveredAttemptSets.get(state);
+  if (cached) return cached;
+  const indexed = new Set(state.deliveredAttemptIds);
+  deliveredAttemptSets.set(state, indexed);
+  return indexed;
+}
 
 function sameConversation(record: SendAttemptRecord, observation: AttemptRecoveryObservation): boolean {
   if (record.tabId !== observation.tabId || record.contentEpoch !== observation.state.observation.contentEpoch) return false;
@@ -51,7 +60,7 @@ export function recoverAttempt(
 
   const pending = observation.state.pendingAttempt;
   const pendingMatches = pending?.attemptId === record.attemptId;
-  const delivered = observation.state.deliveredAttemptIds.includes(record.attemptId);
+  const delivered = deliveredAttemptSet(observation.state).has(record.attemptId);
 
   if (record.state === 'dispatched') {
     if (pendingMatches && delivered) {

@@ -72,8 +72,9 @@ export class OrganizationExecutionBridge {
       `Work item id: ${workItem.id}`,
       `Project root: ${project.root_path}`,
       '',
-      'Use only tools and capabilities actually visible in this ChatGPT Web session. Never claim terminal, filesystem, Git, Remote Desktop, or GAMCTL access unless it is explicitly available.',
-      'If external tools are unavailable, complete this browser-only work by returning a concise factual report and the exact machine-readable status requested by the Work item; never fabricate execution evidence.',
+      'Use only capabilities provisioned by the Workspace Charter and actually visible in this session; capability visibility is authoritative.',
+      'Treat the project root, worktree, Git, browser, and external providers as scoped capabilities. Never assume an unavailable tool and never fabricate execution evidence.',
+      'Use shared artifacts and evidence by reference. If a required capability is unavailable, record a blocked finding with the missing capability and recovery condition.',
     ].join('\n');
     const task: WorkDocument = {
       id: managerTaskId,
